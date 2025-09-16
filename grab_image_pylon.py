@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 
+# -----------------------------------------------------------------------------
+# Keep these three lines at the top. They prevent more than one instace to run.
+from single_instance import SingleInstance
+lock = SingleInstance()
+lock.acquire()
+# -----------------------------------------------------------------------------./gr 
+
+import os
 import cv2
 import sys
 import time
+import pathlib
 import numpy as np
+import open3d as o3d
 from pypylon import pylon
 
 from PyQt5.QtCore import Qt, QTimer, QSize
@@ -11,6 +21,7 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import QApplication, QLabel, QPushButton, QVBoxLayout, QWidget, QSlider
 from PyQt5.QtWidgets import QOpenGLWidget
 from OpenGL.GL import * # type: ignore
+
 
 # -----------------------------------------------------------------------------
 # OpenGL video widget
@@ -26,6 +37,17 @@ class GLVideoWidget(QOpenGLWidget):
         self._frame_h = 1024
         self.board_corners_history = []   # store last N borders
         self.max_history = 50
+
+        self.mesh_vertices = None
+        self.mesh_triangles = None
+        self.mesh_normals = None
+
+    def load_stl(self, filepath):
+        verts, tris, norms = load_stl_with_open3d(filepath)
+        self.mesh_vertices = verts
+        self.mesh_triangles = tris
+        self.mesh_normals = norms
+        self.update()
 
     def set_board_corners(self, pts):
         self.board_corners_history.append(np.asarray(pts, dtype=np.float32))
@@ -83,7 +105,13 @@ class GLVideoWidget(QOpenGLWidget):
         glTexCoord2f(1.0, 0.0); glVertex2f( 1.0,  1.0)
         glTexCoord2f(0.0, 0.0); glVertex2f(-1.0,  1.0)
         glEnd()
+
+        # --- Draw STL mesh ---
+        if self.mesh_vertices is not None:
+            print ('HERE')
+            self._draw_stl()
         
+        # --- Draw CalibPlate's frame ---
         if self.board_corners_history:
             glDisable(GL_TEXTURE_2D)
             glLineWidth(2.0)
@@ -102,6 +130,28 @@ class GLVideoWidget(QOpenGLWidget):
 
             glEnable(GL_TEXTURE_2D)
 
+
+    def _draw_stl(self):
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_TEXTURE_2D)
+
+        glColor3f(0.7, 0.7, 0.9)  # bluish gray
+
+        glPushMatrix()
+        glScalef(0.01, 0.01, 0.01)   # scale down if large
+        glTranslatef(0, 0, -5)       # move into view
+
+        glBegin(GL_TRIANGLES)
+        for tri, n in zip(self.mesh_triangles, self.mesh_normals):
+            glNormal3fv(n)
+            for idx in tri:
+                glVertex3fv(self.mesh_vertices[idx])
+        glEnd()
+
+        glPopMatrix()
+
+        glEnable(GL_TEXTURE_2D)
+        glDisable(GL_DEPTH_TEST)
 
 # -----------------------------------------------------------------------------
 # Camera discovery functions
@@ -132,9 +182,13 @@ def list_cameras():
     return devices
 
 
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Video capture functions
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+    print(os.getcwd())
+    mesh = o3d.io.read_triangle_mesh(str(pathlib.Path(__file__).parent / "base_link.stl"))
+    print(mesh)
+
 def grab_and_show(ip: str) -> None:
     """ Open a Basler camera by IP and stream video until ESC is pressed."""
     di = pylon.DeviceInfo()
@@ -226,9 +280,9 @@ class VideoApp(QWidget):
 
         # Options
         self.draw_axes_center = False
-        self.axes_colors=(  (0, 255, 255),  # X = yellow
-                                                            (255, 0, 255),  # Y = magenta
-                                                            (255, 255, 0))  # Z = cyan
+        self.axes_colors=(  (0, 255, 255),  # X = yellow 
+                          (255, 0, 255),  # Y = magenta
+                          (255, 255, 0))  # Z = cyan
 
         # Button actions
         self.start_button.clicked.connect(self.start_video)
@@ -578,9 +632,25 @@ class VideoApp(QWidget):
         event.accept()
 
 
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# STL
+# -----------------------------------------------------------------------------
+def load_stl_with_open3d(filepath):
+    mesh = o3d.io.read_triangle_mesh(filepath)
+    if not mesh.has_vertex_normals():
+        mesh.compute_vertex_normals()
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    triangles = np.asarray(mesh.triangles, dtype=np.int32)
+    normals = np.asarray(mesh.triangle_normals, dtype=np.float32)
+
+    return vertices, triangles, normals
+
+
+
+# -----------------------------------------------------------------------------
 # Main entry point
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     # devices = list_cameras()
     ip = get_camera_ip_by_id("Edgar")
@@ -588,6 +658,9 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
     window = VideoApp(ip)
+
+    path_to_stl = str(pathlib.Path(__file__).parent / "base_link.stl")
+    # window.gl.load_stl(path_to_stl)
     window.show()
     sys.exit(app.exec_())
 
