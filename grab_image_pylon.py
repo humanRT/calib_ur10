@@ -20,6 +20,7 @@ from pypylon import pylon
 from PyQt5.QtCore import Qt, QTimer, QSize
 from PyQt5.QtWidgets import QApplication, QLabel, QPushButton, QVBoxLayout, QWidget, QSlider
 from PyQt5.QtWidgets import QOpenGLWidget
+from PyQt5.QtWidgets import QMainWindow, QAction, QMenuBar
 from OpenGL.GL import * # type: ignore
 
 
@@ -237,7 +238,7 @@ def grab_and_show(ip: str) -> None:
 # -----------------------------------------------------------------------------
 # Video capture GUI
 # -----------------------------------------------------------------------------
-class VideoApp(QWidget):
+class VideoApp(QMainWindow):
     def __init__(self, ip: str):
         super().__init__()
         self.setWindowTitle("Calian Robotics")
@@ -265,14 +266,22 @@ class VideoApp(QWidget):
         self.exposure_slider = QSlider(Qt.Horizontal) # type: ignore
         self.exposure_slider.setEnabled(False)  # enabled once camera is open
 
-        layout = QVBoxLayout()
+        central_widget = QWidget()
+        layout = QVBoxLayout(central_widget)
         # layout.addWidget(self.label)
         layout.addWidget(self.gl, alignment=Qt.AlignCenter)  # type: ignore
         layout.addWidget(self.start_button)
         layout.addWidget(self.stop_button)
         layout.addWidget(QLabel("Exposure (µs):"))
         layout.addWidget(self.exposure_slider)
-        self.setLayout(layout)
+        self.setCentralWidget(central_widget)
+
+        # Menu bar
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
 
         # Timer for video updates
         self.timer = QTimer()
