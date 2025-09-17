@@ -5,7 +5,7 @@
 from single_instance import SingleInstance
 lock = SingleInstance()
 lock.acquire()
-# -----------------------------------------------------------------------------./gr 
+# -----------------------------------------------------------------------------
 
 import os
 import cv2
@@ -14,10 +14,10 @@ import time
 import pathlib
 import numpy as np
 import open3d as o3d
+from utils import colors
 from pypylon import pylon
 
 from PyQt5.QtCore import Qt, QTimer, QSize
-from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import QApplication, QLabel, QPushButton, QVBoxLayout, QWidget, QSlider
 from PyQt5.QtWidgets import QOpenGLWidget
 from OpenGL.GL import * # type: ignore
@@ -36,7 +36,7 @@ class GLVideoWidget(QOpenGLWidget):
         self._frame_w = 1280   # default before first frame
         self._frame_h = 1024
         self.board_corners_history = []   # store last N borders
-        self.max_history = 50
+        self.max_history = 20
 
         self.mesh_vertices = None
         self.mesh_triangles = None
@@ -307,7 +307,7 @@ class VideoApp(QWidget):
         fx = 800  # focal length in pixels (guess)
         fy = 800
         cx = 640  # image center x (assuming 1280x720 image)
-        cy = 360  # image center y
+        cy = 512  # image center y
 
         self.camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0,  0,  1]], dtype=np.float32)
         self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)  # assume no distortion
@@ -493,9 +493,9 @@ class VideoApp(QWidget):
     def update_frame(self):
         if not (self.cam and self.cam.IsGrabbing() and self.converter):
             return
-
-        res = self.cam.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+        
         try:
+            res = self.cam.RetrieveResult(1000, pylon.TimeoutHandling_ThrowException)    # raise exception if no new frame arrives whithin that timeout
             if res.GrabSucceeded():
                 rgb = self.converter.Convert(res)
                 img_array = rgb.GetArray()
@@ -620,8 +620,17 @@ class VideoApp(QWidget):
                 # Convert back to RGB for OpenGL upload
                 rgb_for_gl = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 self.gl.set_frame(rgb_for_gl)
+        
+        except pylon.TimeoutException:
+            print(colors.text("Connection with camera lost! (timeout)", "red"))
+
+        # except pylon.RuntimeException as e:
+        #     print(colors.text(f"Pylon error: {e}", "yellow"))
+        
         finally:
-            res.Release()
+            # Only release the grab result if we actually got one
+            if res is not None:
+                res.Release()
 
     def closeEvent(self, event): # type: ignore
         """Ensure camera closes cleanly when window exits."""
