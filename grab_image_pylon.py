@@ -14,7 +14,7 @@ import time
 import pathlib
 import numpy as np
 import open3d as o3d
-from utils import colors
+from utils import Colors, FileHelper
 from pypylon import pylon
 
 from PyQt5.QtCore import Qt, QTimer, QSize
@@ -143,10 +143,10 @@ class GLVideoWidget(QOpenGLWidget):
         glTranslatef(0, 0, -5)       # move into view
 
         glBegin(GL_TRIANGLES)
-        for tri, n in zip(self.mesh_triangles, self.mesh_normals):
+        for tri, n in zip(self.mesh_triangles, self.mesh_normals): # type: ignore
             glNormal3fv(n)
             for idx in tri:
-                glVertex3fv(self.mesh_vertices[idx])
+                glVertex3fv(self.mesh_vertices[idx]) # type: ignore
         glEnd()
 
         glPopMatrix()
@@ -278,17 +278,16 @@ class VideoApp(QMainWindow):
 
         # Menu bar
         menubar = self.menuBar()
-        file_menu = menubar.addMenu("File")
+        file_menu = menubar.addMenu("File") # type: ignore
         exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
+        exit_action.triggered.connect(self.close) # type: ignore
+        file_menu.addAction(exit_action) # type: ignore
 
         # Timer for video updates
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
 
         # Options
-        self.draw_axes_center = False
         self.axes_colors=(  (0, 255, 255),  # X = yellow 
                           (255, 0, 255),  # Y = magenta
                           (255, 255, 0))  # Z = cyan
@@ -359,40 +358,35 @@ class VideoApp(QMainWindow):
         cv2.line(img, end, (int(left_x), int(left_y)), color, thickness)
         cv2.line(img, end, (int(right_x), int(right_y)), color, thickness)
     
-    def draw_custom_axes(self, img, rvec, tvec, axis_len, colors) -> None:
+    def draw_custom_axes(self, img, rvec, tvec, axis_len, colors, center=False) -> None:
+        if center:
+            cx = (self.squaresX * self.square_len) / 2.0
+            cy = (self.squaresY * self.square_len) / 2.0
+            origin = np.float32([[cx, cy, 0]]) # type: ignore
+        else:
+            origin = np.float32([[0, 0, 0]]) # type: ignore
+
         axis_pts = np.float32([
-            [0, 0, 0],
-            [axis_len, 0, 0],
-            [0, axis_len, 0],
-            [0, 0, axis_len]
+            origin[0], # type: ignore
+            origin[0] + [axis_len, 0, 0], # type: ignore
+            origin[0] + [0, axis_len, 0], # type: ignore
+            origin[0] + [0, 0, axis_len], # type: ignore
         ]) # type: ignore
 
         imgpts, _ = cv2.projectPoints(axis_pts, rvec, tvec, self.camera_matrix, self.dist_coeffs) # type: ignore
-
         if imgpts is None or imgpts.size < 8:
             return
 
-        imgpts = imgpts.reshape(-1, 2)
-
-        pts = []
-        for pt in imgpts:
-            x, y = pt
-            if not np.isfinite(x) or not np.isfinite(y):
-                return  # skip if invalid
-            xi, yi = int(round(float(x))), int(round(float(y)))
-            # skip if far outside image (garbage projection)
-            if abs(xi) > img.shape[1] * 10 or abs(yi) > img.shape[0] * 10:
-                return
-            pts.append((xi, yi))
-
+        # Convert to plain Python int tuples
+        pts = [(int(round(float(x))), int(round(float(y)))) for x, y in imgpts.reshape(-1, 2)]
         if len(pts) < 4:
             return
 
         o, x, y, z = pts
-
         self.draw_arrow(img, o, x, colors[0], thickness=3, arrow_magnitude=15, angle=25)
         self.draw_arrow(img, o, y, colors[1], thickness=3, arrow_magnitude=15, angle=25)
         self.draw_arrow(img, o, z, colors[2], thickness=3, arrow_magnitude=15, angle=25)
+
    
     def draw_grid_circles(self, img, target_cells=24):
         h, w, _ = img.shape
@@ -419,17 +413,17 @@ class VideoApp(QMainWindow):
 
         # Draw circles
         for r in range(self.rows):
-            for c in range(self.cols):
-                cx = int(c * self.cell_w + self.cell_w / 2)
-                cy = int(r * self.cell_h + self.cell_h / 2)
-                radius = int(0.75 * self.cell_w / 2)
+            for c in range(self.cols): # type: ignore
+                cx = int(c * self.cell_w + self.cell_w / 2) # type: ignore
+                cy = int(r * self.cell_h + self.cell_h / 2) # type: ignore
+                radius = int(0.75 * self.cell_w / 2) # type: ignore
 
-                if self.cell_active[r, c]:
+                if self.cell_active[r, c]: # type: ignore
                     color = (0, 255, 0)  # solid green
                     cv2.circle(img, (cx, cy), radius, color, -1)
                 else:
                     color = (255, 255, 255)
-                    cv2.circle(img, (cx, cy), radius, color, 1)
+                    cv2.circle(img, (cx, cy), radius, color, 2)
 
         return self.rows, self.cols, self.cell_h, self.cell_w
 
@@ -442,15 +436,15 @@ class VideoApp(QMainWindow):
 
         for r in range(self.rows):
             for c in range(self.cols):
-                cx = int(c * self.cell_w + self.cell_w / 2)
-                cy = int(r * self.cell_h + self.cell_h / 2)
-                radius = int(0.75 * self.cell_w / 2)
+                cx = int(c * self.cell_w + self.cell_w / 2) # type: ignore
+                cy = int(r * self.cell_h + self.cell_h / 2) # type: ignore
+                radius = int(0.75 * self.cell_w / 2) # type: ignore
 
                 # Distance from circle center
                 dist = np.hypot(x - cx, y - cy)
 
                 if dist <= radius:
-                    self.cell_active[r, c] = True
+                    self.cell_active[r, c] = True # type: ignore
                     return  # stop once we find the circle
 
     def keyPressEvent(self, event): # type: ignore
@@ -500,6 +494,8 @@ class VideoApp(QMainWindow):
                 print("Exposure set failed:", e)
 
     def update_frame(self):
+        res = None
+        
         if not (self.cam and self.cam.IsGrabbing() and self.converter):
             return
         
@@ -576,14 +572,14 @@ class VideoApp(QMainWindow):
                             origin_imgpt = origin_imgpt.reshape(2)
 
                             # Red debug dot at origin
-                            cv2.circle(overlay, (int(origin_imgpt[0]), int(origin_imgpt[1])), 6, (0, 0, 255), -1)
+                            cv2.circle(overlay, (int(origin_imgpt[0]), int(origin_imgpt[1])), 12, (255, 255, 255), -1)
 
                             # Activate circle if origin is inside one
                             self.mark_cell_from_origin(origin_imgpt)
 
                             # Save copy before drawing axes
                             before_axes = overlay.copy()
-                            self.draw_custom_axes(overlay, rvec, tvec, axis_len=0.05, colors=self.axes_colors)
+                            self.draw_custom_axes(overlay, rvec, tvec, axis_len=0.05, colors=self.axes_colors, center=True)
 
                             # Check if axes changed the overlay
                             if not np.array_equal(before_axes, overlay):
@@ -631,7 +627,7 @@ class VideoApp(QMainWindow):
                 self.gl.set_frame(rgb_for_gl)
         
         except pylon.TimeoutException:
-            print(colors.text("Connection with camera lost! (timeout)", "red"))
+            print(Colors.text("Connection with camera lost! (timeout)", "red"))
 
         # except pylon.RuntimeException as e:
         #     print(colors.text(f"Pylon error: {e}", "yellow"))
@@ -670,12 +666,20 @@ def load_stl_with_open3d(filepath):
 # Main entry point
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # devices = list_cameras()
-    ip = get_camera_ip_by_id("Edgar")
-    print(f"IP: {ip}")
-
     app = QApplication(sys.argv)
-    window = VideoApp(ip)
+    
+    devices = list_cameras()
+
+    device_name = "Edgar"
+    ip = get_camera_ip_by_id(device_name)
+    calib_path = f"calibData_{device_name}"
+    
+    print(f"IP: {ip}")
+    print(f"calibData Path: {calib_path}")
+
+    window = VideoApp(ip)    
+    file_helper = FileHelper()
+    file_helper.create_directory(calib_path, force_replace=True)
 
     path_to_stl = str(pathlib.Path(__file__).parent / "base_link.stl")
     # window.gl.load_stl(path_to_stl)
