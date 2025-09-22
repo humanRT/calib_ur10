@@ -15,6 +15,7 @@ import pathlib
 import numpy as np
 import open3d as o3d
 from utils import Colors, FileHelper
+from focus_assistant import FocusAssistant
 from pypylon import pylon
 
 from PyQt5.QtCore import Qt, QTimer, QSize
@@ -239,14 +240,20 @@ def grab_and_show(ip: str) -> None:
 # Video capture GUI
 # -----------------------------------------------------------------------------
 class VideoApp(QMainWindow):
-    def __init__(self, ip: str):
+    def __init__(self, ip: str, calib_path: str):
         super().__init__()
         self.setWindowTitle("Calian Robotics")
+        self.focus_assistant = FocusAssistant()
 
         # Camera setup
         self.ip = ip
         self.cam = None
         self.converter = None
+        self.focus_active = True
+        self._plate_seen_start = None  # timestamp of when plate was first detected
+
+        # Environment setup
+        self.calib_path = calib_path
 
         self.prev_time = None
         self.fps = 0.0
@@ -256,12 +263,14 @@ class VideoApp(QMainWindow):
         self.cols = None
         self.cell_h = None
         self.cell_w = None
-        self.cell_active = None  # 2D boolean array: True = circle stays green
+        self.cell_active = np.zeros((0, 0), dtype=bool)
 
         # Widgets
         self.gl = GLVideoWidget(self)
         self.label = QLabel("Camera feed will appear here")
         self.start_button = QPushButton("Start")
+        self.focus_button = QPushButton("Focus")
+        self.clear_button = QPushButton("Clear")
         self.stop_button = QPushButton("Stop")
         self.exposure_slider = QSlider(Qt.Horizontal) # type: ignore
         self.exposure_slider.setEnabled(False)  # enabled once camera is open
@@ -271,6 +280,8 @@ class VideoApp(QMainWindow):
         # layout.addWidget(self.label)
         layout.addWidget(self.gl, alignment=Qt.AlignCenter)  # type: ignore
         layout.addWidget(self.start_button)
+        layout.addWidget(self.focus_button)
+        layout.addWidget(self.clear_button)
         layout.addWidget(self.stop_button)
         layout.addWidget(QLabel("Exposure (µs):"))
         layout.addWidget(self.exposure_slider)
@@ -294,6 +305,8 @@ class VideoApp(QMainWindow):
 
         # Button actions
         self.start_button.clicked.connect(self.start_video)
+        self.focus_button.clicked.connect(self.focus_assist)
+        self.clear_button.clicked.connect(self.clear_images)
         self.stop_button.clicked.connect(self.stop_video)
         self.exposure_slider.valueChanged.connect(self.set_exposure)
 
@@ -333,30 +346,33 @@ class VideoApp(QMainWindow):
         :param arrow_magnitude: length of the arrowhead lines in pixels
         :param angle: half angle of the arrowhead in degrees
         """
+        # Ensure plain Python int tuples (robust to NumPy arrays/scalars)
+        start = tuple(map(int, np.array(start).flatten()[:2]))
+        end   = tuple(map(int, np.array(end).flatten()[:2]))
+        color = tuple(int(c) for c in color)
+
         # Draw shaft
-        cv2.line(img, start, end, color, thickness)
+        try:
+            cv2.line(img, start, end, color, thickness)
 
-        # Vector from end to start
-        dx, dy = start[0] - end[0], start[1] - end[1]
-        length = np.hypot(dx, dy)
+            dx, dy = start[0] - end[0], start[1] - end[1]
+            length = np.hypot(dx, dy)
+            if length == 0:
+                return
 
-        if length == 0:
-            return
+            ux, uy = dx / length, dy / length
 
-        # Unit vector
-        ux, uy = dx / length, dy / length
+            # Arrowhead
+            left_x = end[0] + arrow_magnitude * (ux * np.cos(np.radians(angle)) - uy * np.sin(np.radians(angle)))
+            left_y = end[1] + arrow_magnitude * (ux * np.sin(np.radians(angle)) + uy * np.cos(np.radians(angle)))
 
-        # Rotate by +angle
-        left_x = end[0] + arrow_magnitude * (ux * np.cos(np.radians(angle)) - uy * np.sin(np.radians(angle)))
-        left_y = end[1] + arrow_magnitude * (ux * np.sin(np.radians(angle)) + uy * np.cos(np.radians(angle)))
+            right_x = end[0] + arrow_magnitude * (ux * np.cos(-np.radians(angle)) - uy * np.sin(-np.radians(angle)))
+            right_y = end[1] + arrow_magnitude * (ux * np.sin(-np.radians(angle)) + uy * np.cos(-np.radians(angle)))
 
-        # Rotate by -angle
-        right_x = end[0] + arrow_magnitude * (ux * np.cos(-np.radians(angle)) - uy * np.sin(-np.radians(angle)))
-        right_y = end[1] + arrow_magnitude * (ux * np.sin(-np.radians(angle)) + uy * np.cos(-np.radians(angle)))
-
-        # Draw arrowhead
-        cv2.line(img, end, (int(left_x), int(left_y)), color, thickness)
-        cv2.line(img, end, (int(right_x), int(right_y)), color, thickness)
+            cv2.line(img, end, (int(left_x), int(left_y)), color, thickness)
+            cv2.line(img, end, (int(right_x), int(right_y)), color, thickness)
+        finally:
+            pass
     
     def draw_custom_axes(self, img, rvec, tvec, axis_len, colors, center=False) -> None:
         if center:
@@ -386,7 +402,6 @@ class VideoApp(QMainWindow):
         self.draw_arrow(img, o, x, colors[0], thickness=3, arrow_magnitude=15, angle=25)
         self.draw_arrow(img, o, y, colors[1], thickness=3, arrow_magnitude=15, angle=25)
         self.draw_arrow(img, o, z, colors[2], thickness=3, arrow_magnitude=15, angle=25)
-
    
     def draw_grid_circles(self, img, target_cells=24):
         h, w, _ = img.shape
@@ -427,10 +442,21 @@ class VideoApp(QMainWindow):
 
         return self.rows, self.cols, self.cell_h, self.cell_w
 
-    def mark_cell_from_origin(self, imgpt):
-        """Mark the circle that actually contains the projected origin pixel."""
+    def activate_cell_at_point(self, imgpt):
+        """
+        Try to activate the grid cell containing the given point.
+
+        Args:
+            imgpt: (x, y) pixel coordinates
+
+        Returns:
+            (success: bool, cell_id: tuple[int, int] | None)
+            success = True if a *new* cell was activated
+            False if no cell was found or it was already active
+            cell_id = (row, col) of activated cell, or (-1, -1) if none
+        """
         if self.rows is None or self.cols is None:
-            return
+            return False, (-1, -1)
 
         x, y = int(imgpt[0]), int(imgpt[1])
 
@@ -444,8 +470,15 @@ class VideoApp(QMainWindow):
                 dist = np.hypot(x - cx, y - cy)
 
                 if dist <= radius:
-                    self.cell_active[r, c] = True # type: ignore
-                    return  # stop once we find the circle
+                    # Already active? → return False
+                    if self.cell_active[r, c]:
+                        return False, (r, c)
+
+                    # Newly activated
+                    self.cell_active[r, c] = True
+                    return True, (r, c)
+
+        return False, (-1, -1)
 
     def keyPressEvent(self, event): # type: ignore
         """Exit cleanly when ESC is pressed."""
@@ -476,6 +509,12 @@ class VideoApp(QMainWindow):
             self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
 
         self.timer.start(30)
+
+    def focus_assist(self):
+        self.focus_active = not self.focus_active
+
+    def clear_images(self):
+        pass
 
     def stop_video(self):
         self.timer.stop()
@@ -512,8 +551,9 @@ class VideoApp(QMainWindow):
 
                 # ---- Draw transparent grid circles (background) ----
                 grid = overlay.copy()
-                self.draw_grid_circles(grid, 24)
-                cv2.addWeighted(grid, 0.3, overlay, 0.7, 0, overlay)
+                if not self.focus_active:
+                    self.draw_grid_circles(grid, 24)
+                    cv2.addWeighted(grid, 0.3, overlay, 0.7, 0, overlay)
 
                 # ---- FPS calculation ----
                 now = time.time()
@@ -549,6 +589,7 @@ class VideoApp(QMainWindow):
                         ) # type: ignore
 
                         pose_drawn = False
+
                         if ok and rvec is not None and tvec is not None:
                             # 3D board corners in board coordinates (Z=0 plane)
                             L = self.square_len
@@ -571,11 +612,25 @@ class VideoApp(QMainWindow):
                             )
                             origin_imgpt = origin_imgpt.reshape(2)
 
-                            # Red debug dot at origin
-                            cv2.circle(overlay, (int(origin_imgpt[0]), int(origin_imgpt[1])), 12, (255, 255, 255), -1)
+                            # Green debug dot at origin
+                            cv2.circle(overlay, (int(origin_imgpt[0]), int(origin_imgpt[1])), 12, (0, 255, 0), -1)
 
-                            # Activate circle if origin is inside one
-                            self.mark_cell_from_origin(origin_imgpt)
+                            # -------------------------------------------------
+                            # Cell activation logic/actions
+                            if not self.focus_active:
+                                success, cell_id = self.activate_cell_at_point(origin_imgpt)    # Activate circle if origin is inside one
+                                if success:
+                                    print(f"{Colors().text(str(cell_id), 'green')}")
+                                    
+                                    # Capture image and save the image
+                                    r, c = cell_id
+                                    filename = f"cell_{r}_{c}.png"
+                                    filepath = os.path.join(self.calib_path, filename)
+
+                                    # Save the current overlay image (with drawings) to file
+                                    cv2.imwrite(filepath, cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR))
+                                    print(f"Saved raw image: {filepath}")
+                                # -------------------------------------------------
 
                             # Save copy before drawing axes
                             before_axes = overlay.copy()
@@ -586,6 +641,10 @@ class VideoApp(QMainWindow):
                                 pose_drawn = True
                                 border_color = (0, 255, 0)  # green
                         
+                        else:
+                            # Lost detection: reset timer
+                            self._plate_seen_start = None
+
                         if not pose_drawn:
                             border_color = (255, 0, 0)  # red (pose unstable or axes skipped)
 
@@ -621,6 +680,11 @@ class VideoApp(QMainWindow):
                 # bytes_per_line = ch * w
                 # qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
                 # self.label.setPixmap(QPixmap.fromImage(qimg))
+
+                # --- Focus assistant ---
+                if self.focus_active:
+                    norm, hint, improving = self.focus_assistant.get_focus_info(img_array)
+                    self.focus_assistant.draw_focus_bar(bgr, norm, hint, improving)  # draw on bgr, not overlay
 
                 # Convert back to RGB for OpenGL upload
                 rgb_for_gl = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -677,7 +741,7 @@ if __name__ == "__main__":
     print(f"IP: {ip}")
     print(f"calibData Path: {calib_path}")
 
-    window = VideoApp(ip)    
+    window = VideoApp(ip, calib_path=calib_path)    
     file_helper = FileHelper()
     file_helper.create_directory(calib_path, force_replace=True)
 
