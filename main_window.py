@@ -1,244 +1,17 @@
-#!/usr/bin/env python3
-
-# -----------------------------------------------------------------------------
-# Keep these three lines at the top. They prevent more than one instace to run.
-from single_instance import SingleInstance
-lock = SingleInstance()
-lock.acquire()
-# -----------------------------------------------------------------------------
-
 import os
-import cv2
-import sys
+import cv2 
 import time
-import pathlib
 import numpy as np
-import open3d as o3d
-from utils import Colors, FileHelper
-from focus_assistant import FocusAssistant
+
 from pypylon import pylon
-
-from PyQt5.QtCore import Qt, QTimer, QSize
-from PyQt5.QtWidgets import QApplication, QLabel, QPushButton, QVBoxLayout, QWidget, QSlider
-from PyQt5.QtWidgets import QOpenGLWidget
-from PyQt5.QtWidgets import QMainWindow, QAction, QMenuBar
-from OpenGL.GL import * # type: ignore
-
-
-# -----------------------------------------------------------------------------
-# OpenGL video widget
-# -----------------------------------------------------------------------------
-class GLVideoWidget(QOpenGLWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.frame = None # numpy uint8 HxWx3 RGB
-        self.texture_id = None
-        self._w = 1
-        self._h = 1
-        self._frame_w = 1280   # default before first frame
-        self._frame_h = 1024
-        self.board_corners_history = []   # store last N borders
-        self.max_history = 20
-
-        self.mesh_vertices = None
-        self.mesh_triangles = None
-        self.mesh_normals = None
-
-    def load_stl(self, filepath):
-        verts, tris, norms = load_stl_with_open3d(filepath)
-        self.mesh_vertices = verts
-        self.mesh_triangles = tris
-        self.mesh_normals = norms
-        self.update()
-
-    def set_board_corners(self, pts):
-        self.board_corners_history.append(np.asarray(pts, dtype=np.float32))
-        if len(self.board_corners_history) > self.max_history:
-            self.board_corners_history.pop(0)
-        self.update()
-
-    def sizeHint(self):
-        return QSize(self._frame_w, self._frame_h)
-
-    def set_frame(self, rgb_frame: np.ndarray):
-        self.frame = rgb_frame
-        h, w, _ = rgb_frame.shape
-        if (w, h) != (self._frame_w, self._frame_h):
-            self._frame_w, self._frame_h = w, h
-            self.updateGeometry()   # notify layout that sizeHint changed
-        self.update()
-
-    def initializeGL(self):
-        glClearColor(0.0, 0.0, 0.0, 1.0)
-        glDisable(GL_DEPTH_TEST)
-        glEnable(GL_TEXTURE_2D)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        
-        self.texture_id = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_2D, self.texture_id)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP)
-
-    def resizeGL(self, w, h):
-        self._w = max(1, w)
-        self._h = max(1, h)
-        glViewport(0, 0, self._w, self._h)
-
-    def paintGL(self):
-        glClear(GL_COLOR_BUFFER_BIT)
-        if self.frame is None:
-            return
-
-        h, w, _ = self.frame.shape
-
-        # Upload texture
-        glBindTexture(GL_TEXTURE_2D, self.texture_id)
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, self.frame)
-
-        # Draw textured quad filling the viewport
-        glColor3f(1.0, 1.0, 1.0)
-        glBegin(GL_QUADS)
-        glTexCoord2f(0.0, 1.0); glVertex2f(-1.0, -1.0)
-        glTexCoord2f(1.0, 1.0); glVertex2f( 1.0, -1.0)
-        glTexCoord2f(1.0, 0.0); glVertex2f( 1.0,  1.0)
-        glTexCoord2f(0.0, 0.0); glVertex2f(-1.0,  1.0)
-        glEnd()
-
-        # --- Draw STL mesh ---
-        if self.mesh_vertices is not None:
-            print ('HERE')
-            self._draw_stl()
-        
-        # --- Draw CalibPlate's frame ---
-        if self.board_corners_history:
-            glDisable(GL_TEXTURE_2D)
-            glLineWidth(2.0)
-
-            n = len(self.board_corners_history)
-            for i, corners in enumerate(self.board_corners_history):
-                alpha = (i + 1) / n    # older = fainter
-                glColor4f(1.0, 0.0, 0.0, alpha)  # RGBA, requires blending
-
-                glBegin(GL_LINE_LOOP)
-                for (px, py) in corners:
-                    ndc_x = (px / w) * 2.0 - 1.0
-                    ndc_y = 1.0 - (py / h) * 2.0
-                    glVertex2f(ndc_x, ndc_y)
-                glEnd()
-
-            glEnable(GL_TEXTURE_2D)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import QMainWindow, QLabel, QPushButton, QVBoxLayout, QWidget, QSlider, QAction
+from camera_utils import *
+from gl_video_widget import GLVideoWidget
+from focus_assistant import FocusAssistant
+from utils import Colors
 
 
-    def _draw_stl(self):
-        glEnable(GL_DEPTH_TEST)
-        glDisable(GL_TEXTURE_2D)
-
-        glColor3f(0.7, 0.7, 0.9)  # bluish gray
-
-        glPushMatrix()
-        glScalef(0.01, 0.01, 0.01)   # scale down if large
-        glTranslatef(0, 0, -5)       # move into view
-
-        glBegin(GL_TRIANGLES)
-        for tri, n in zip(self.mesh_triangles, self.mesh_normals): # type: ignore
-            glNormal3fv(n)
-            for idx in tri:
-                glVertex3fv(self.mesh_vertices[idx]) # type: ignore
-        glEnd()
-
-        glPopMatrix()
-
-        glEnable(GL_TEXTURE_2D)
-        glDisable(GL_DEPTH_TEST)
-
-# -----------------------------------------------------------------------------
-# Camera discovery functions
-# -----------------------------------------------------------------------------
-def get_camera_ip_by_id(target_id: str) -> str:
-    """Find the IP address of a camera that matches a given ID."""
-    for dev in pylon.TlFactory.GetInstance().EnumerateDevices():
-        if target_id in (dev.GetSerialNumber(), dev.GetFriendlyName(), dev.GetUserDefinedName()):
-            if dev.GetDeviceClass() == "BaslerGigE":
-                return dev.GetIpAddress()
-            raise ValueError(f"Camera {target_id} found but not GigE")
-    raise LookupError(f"No camera found matching {target_id}")
-
-def list_cameras():
-    """List all connected Basler cameras with their IDs."""
-    factory = pylon.TlFactory.GetInstance()
-    devices = factory.EnumerateDevices()
-
-    if not devices:
-        print("No cameras found.")
-        return []
-
-    print("Connected cameras:")
-    for i, dev in enumerate(devices):
-        print(f"[{i}] Name: {dev.GetFriendlyName()}, "
-              f"Serial: {dev.GetSerialNumber()}, "
-              f"IP: {dev.GetIpAddress() if dev.GetDeviceClass() == 'BaslerGigE' else 'N/A'}")
-    return devices
-
-
-# -----------------------------------------------------------------------------
-# Video capture functions
-# -----------------------------------------------------------------------------
-    print(os.getcwd())
-    mesh = o3d.io.read_triangle_mesh(str(pathlib.Path(__file__).parent / "base_link.stl"))
-    print(mesh)
-
-def grab_and_show(ip: str) -> None:
-    """ Open a Basler camera by IP and stream video until ESC is pressed."""
-    di = pylon.DeviceInfo()
-    di.SetIpAddress(ip)
-
-    cam = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateDevice(di))
-
-    try:
-        cam.Open()
-        cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-
-        converter = pylon.ImageFormatConverter()
-        converter.OutputPixelFormat = pylon.PixelType_RGB8packed
-        converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
-
-        print(f"Streaming from camera at {ip}. Press ESC to exit.")
-
-        while cam.IsGrabbing():
-            res = cam.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-            try:
-                if res.GrabSucceeded():
-                    rgb = converter.Convert(res)
-                    img_array = rgb.GetArray()
-
-                    # Convert RGB → BGR for OpenCV
-                    bgr_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-
-                    # Show live video
-                    cv2.imshow("Basler Live Video", bgr_array)
-
-                    # Exit on ESC
-                    if cv2.waitKey(1) == 27:
-                        break
-                else:
-                    raise RuntimeError(
-                        f"Grab failed: {res.ErrorCode} {res.ErrorDescription}"
-                    )
-            finally:
-                res.Release()
-
-    finally:
-        cam.Close()
-        cv2.destroyAllWindows()
-
-
-# -----------------------------------------------------------------------------
-# Video capture GUI
-# -----------------------------------------------------------------------------
 class VideoApp(QMainWindow):
     def __init__(self, ip: str, calib_path: str):
         super().__init__()
@@ -487,9 +260,7 @@ class VideoApp(QMainWindow):
 
     def start_video(self):
         if self.cam is None:
-            di = pylon.DeviceInfo()
-            di.SetIpAddress(self.ip)
-            self.cam = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateDevice(di))
+            self.cam = create_camera(self.ip)
             self.cam.Open()
 
             # Configure exposure slider range
@@ -500,12 +271,11 @@ class VideoApp(QMainWindow):
             self.exposure_slider.setValue(exp_current)
             self.exposure_slider.setEnabled(True)
 
-        # (Re)create converter here every time
-        self.converter = pylon.ImageFormatConverter()
-        self.converter.OutputPixelFormat = pylon.PixelType_RGB8packed
-        self.converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+        # (Re)create converter every time
+        self.converter = make_converter()
 
         if not self.cam.IsGrabbing():
+            from pypylon import pylon  # local import, only for the enum
             self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
 
         self.timer.start(30)
@@ -514,7 +284,17 @@ class VideoApp(QMainWindow):
         self.focus_active = not self.focus_active
 
     def clear_images(self):
-        pass
+        """Clear any activated grid cells and refresh the view."""
+        # If the grid has been initialized, reset activation state
+        if isinstance(self.cell_active, np.ndarray) and self.cell_active.size > 0:
+            self.cell_active[...] = False
+        # Optional: also clear the fading red board-corner trails in the GL overlay
+        # Comment this out if you want to keep the trails when clearing cells
+        if hasattr(self.gl, "board_corners_history"):
+            self.gl.board_corners_history.clear()
+
+        # Force an immediate visual refresh
+        self.gl.update()
 
     def stop_video(self):
         self.timer.stop()
@@ -708,46 +488,3 @@ class VideoApp(QMainWindow):
             self.cam.Close()
             self.cam = None
         event.accept()
-
-
-# -----------------------------------------------------------------------------
-# STL
-# -----------------------------------------------------------------------------
-def load_stl_with_open3d(filepath):
-    mesh = o3d.io.read_triangle_mesh(filepath)
-    if not mesh.has_vertex_normals():
-        mesh.compute_vertex_normals()
-
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    triangles = np.asarray(mesh.triangles, dtype=np.int32)
-    normals = np.asarray(mesh.triangle_normals, dtype=np.float32)
-
-    return vertices, triangles, normals
-
-
-
-# -----------------------------------------------------------------------------
-# Main entry point
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    
-    devices = list_cameras()
-
-    device_name = "Edgar"
-    ip = get_camera_ip_by_id(device_name)
-    calib_path = f"calibData_{device_name}"
-    
-    print(f"IP: {ip}")
-    print(f"calibData Path: {calib_path}")
-
-    window = VideoApp(ip, calib_path=calib_path)    
-    file_helper = FileHelper()
-    file_helper.create_directory(calib_path, force_replace=True)
-
-    path_to_stl = str(pathlib.Path(__file__).parent / "base_link.stl")
-    # window.gl.load_stl(path_to_stl)
-    window.show()
-    sys.exit(app.exec_())
-
-# %%
