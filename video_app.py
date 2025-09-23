@@ -13,7 +13,7 @@ from utils import Colors
 
 
 class VideoApp(QMainWindow):
-    def __init__(self, ip: str, calib_path: str):
+    def __init__(self, ip: str, calib_path: str, stl_path : str | None = None):
         super().__init__()
         self.setWindowTitle("Calian Robotics")
         self.focus_assistant = FocusAssistant()
@@ -40,6 +40,10 @@ class VideoApp(QMainWindow):
 
         # Widgets
         self.gl = GLVideoWidget(self)
+
+        if stl_path:
+            self.gl.load_stl(stl_path)
+
         self.label = QLabel("Camera feed will appear here")
         self.start_button = QPushButton("Start")
         self.focus_button = QPushButton("Focus")
@@ -105,6 +109,10 @@ class VideoApp(QMainWindow):
 
         self.camera_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0,  0,  1]], dtype=np.float32)
         self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)  # assume no distortion
+
+
+        self.gl.configure_board(self.squaresX, self.squaresY, self.square_len)
+        self.gl.set_camera_calibration(self.camera_matrix, self.dist_coeffs)
 
         self.start_video()
 
@@ -395,6 +403,8 @@ class VideoApp(QMainWindow):
                             # Green debug dot at origin
                             cv2.circle(overlay, (int(origin_imgpt[0]), int(origin_imgpt[1])), 12, (0, 255, 0), -1)
 
+                            self.gl.set_board_pose(rvec, tvec)
+                            
                             # -------------------------------------------------
                             # Cell activation logic/actions
                             if not self.focus_active:

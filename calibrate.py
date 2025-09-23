@@ -2,7 +2,7 @@
 
 # -----------------------------------------------------------------------------
 # Keep these three lines at the top. They prevent more than one instace to run.
-from single_instance import SingleInstance
+from utils import SingleInstance
 lock = SingleInstance()
 lock.acquire()
 # -----------------------------------------------------------------------------
@@ -11,10 +11,9 @@ import sys
 import pathlib
 
 from PyQt5.QtWidgets import QApplication
-
+from utils import Colors, FileHelper
 from camera_utils import *
-from utils import FileHelper
-from main_window import VideoApp
+from video_app import VideoApp
 
 def main():
     app = QApplication(sys.argv)
@@ -29,7 +28,9 @@ def main():
     print(f"IP: {ip}")
     print(f"calibData Path: {calib_path}")
 
-    window = VideoApp(ip, calib_path=calib_path)
+    # path_to_stl = str(script_dir / "resources" / "base_link.stl")
+    path_to_stl = None
+    window = VideoApp(ip, calib_path=calib_path, stl_path=path_to_stl)
     window.show()
     sys.exit(app.exec_())
 
