@@ -7,6 +7,7 @@ lock = SingleInstance()
 lock.acquire()
 # -----------------------------------------------------------------------------
 
+import os
 import sys
 import pathlib
 
@@ -16,6 +17,8 @@ from camera_utils import *
 from video_app import VideoApp
 
 def main():
+    # os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+    # os.environ["QT_SCALE_FACTOR"] = "1.5"
     app = QApplication(sys.argv)
     _ = list_cameras()
 
@@ -39,3 +42,4 @@ if __name__ == "__main__":
 
 
 # %%
+

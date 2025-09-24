@@ -1,8 +1,9 @@
 import cv2
 import numpy as np
+from collections import  Counter
 from typing import Optional
 from PyQt5.QtCore import QSize
-from PyQt5.QtWidgets import QOpenGLWidget
+from PyQt5.QtWidgets import QOpenGLWidget, QSizePolicy
 from OpenGL.GL import *   # type: ignore
 from OpenGL.GLU import *
 from stl_utils import load_stl_file
@@ -26,10 +27,11 @@ class GLVideoWidget(QOpenGLWidget):
         self.square_len = float(square_len)
         self.update()
 
-    def set_board_pose(self, rvec: np.ndarray, tvec: np.ndarray) -> None:
+    def set_board_pose(self, rvec: np.ndarray, tvec: np.ndarray, board_corner_history: list[np.ndarray]) -> None:
         # Expect shapes (3,1) or (1,3) or (3,)
         self.rvec = np.array(rvec, dtype=np.float32).reshape(3, 1)
         self.tvec = np.array(tvec, dtype=np.float32).reshape(3, 1)
+        self.board_corners_history = board_corner_history
         self.pose_valid = True
         self.update()
 
@@ -43,18 +45,13 @@ class GLVideoWidget(QOpenGLWidget):
         verts, tris, norms = load_stl_file(filepath)
         self.mesh_vertices, self.mesh_triangles, self.mesh_normals = verts, tris, norms
         self.update()
-
-    def set_board_corners(self, pts: np.ndarray) -> None:
-        self.board_corners_history.append(np.asarray(pts, dtype=np.float32))
-        if len(self.board_corners_history) > self.max_history:
-            self.board_corners_history.pop(0)
-        self.update()
-
+    
     def set_frame(self, rgb_frame: np.ndarray) -> None:
         self.frame = rgb_frame
         h, w, _ = rgb_frame.shape
         if (w, h) != (self._frame_w, self._frame_h):
             self._frame_w, self._frame_h = w, h
+            self.setFixedSize(w, h)
             self.updateGeometry()
         self.update()
 
@@ -66,9 +63,10 @@ class GLVideoWidget(QOpenGLWidget):
         self.texture_id: Optional[int] = None
         self._w, self._h = 1, 1
         self._frame_w, self._frame_h = 1280, 1024
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setFixedSize(self._frame_w, self._frame_h)
         # overlays
         self.board_corners_history: list[np.ndarray] = []
-        self.max_history = 20
         # STL mesh
         self.mesh_vertices = None
         self.mesh_triangles = None
@@ -107,11 +105,11 @@ class GLVideoWidget(QOpenGLWidget):
 
     # ---------- rendering ----------
     def paintGL(self):
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) # type: ignore
 
         # -- Pass 1: 2D video + red corners overlay
         if self.frame is not None:
-            self._draw_video_and_corners()
+            self.draw_video_and_corners()            
 
         # Ensure a clean Z buffer before 3D
         glClear(GL_DEPTH_BUFFER_BIT)
@@ -121,11 +119,11 @@ class GLVideoWidget(QOpenGLWidget):
             self.draw_cube_on_plate()
         elif self.mesh_vertices is not None:
             # Fallback: free 3D view of STL if no pose
-            self._draw_stl_freecam()
+            self.draw_stl_freecam()
 
     # ---------- helpers: 2D pass ----------
-    def _draw_video_and_corners(self):
-        h, w, _ = self.frame.shape
+    def draw_video_and_corners(self):
+        h, w, _ = self.frame.shape # type: ignore
 
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
@@ -174,11 +172,11 @@ class GLVideoWidget(QOpenGLWidget):
         glMatrixMode(GL_MODELVIEW)
 
     # ---------- helpers: 3D registered to camera ----------
-    def _load_projection_from_intrinsics(self, near: float = 0.01, far: float = 100.0):
-        fx = float(self.camera_matrix[0, 0])
-        fy = float(self.camera_matrix[1, 1])
-        cx = float(self.camera_matrix[0, 2])
-        cy = float(self.camera_matrix[1, 2])
+    def load_projection_from_intrinsics(self, near: float = 0.01, far: float = 100.0):
+        fx = float(self.camera_matrix[0, 0]) # type: ignore
+        fy = float(self.camera_matrix[1, 1]) # type: ignore
+        cx = float(self.camera_matrix[0, 2]) # type: ignore
+        cy = float(self.camera_matrix[1, 2]) # type: ignore
 
         w = float(max(1, self._w))
         h = float(max(1, self._h))
@@ -198,10 +196,10 @@ class GLVideoWidget(QOpenGLWidget):
         glLoadMatrixf(proj.T)
 
     def load_modelview_from_cv_pose(self):
-        R, _ = cv2.Rodrigues(self.rvec)  # board→camera
+        R, _ = cv2.Rodrigues(self.rvec)  # type: ignore # board→camera
         Rt = np.eye(4, dtype=np.float32)
         Rt[:3, :3] = R.astype(np.float32)
-        Rt[:3, 3] = self.tvec.reshape(3).astype(np.float32)
+        Rt[:3, 3] = self.tvec.reshape(3).astype(np.float32) # type: ignore
 
         flip_yz = np.diag([1.0, -1.0, -1.0, 1.0])
 
@@ -211,11 +209,11 @@ class GLVideoWidget(QOpenGLWidget):
         glLoadMatrixf((flip_yz @ Rt).T)
 
     def draw_cube_on_plate(self):
-        self._load_projection_from_intrinsics()
+        self.load_projection_from_intrinsics()
         self.load_modelview_from_cv_pose()
 
-        board_w = float(self.squaresX) * float(self.square_len)
-        board_h = float(self.squaresY) * float(self.square_len)
+        board_w = float(self.squaresX) * float(self.square_len) # type: ignore
+        board_h = float(self.squaresY) * float(self.square_len) # type: ignore
         cube_height = 0.5 * min(board_w, board_h)  # make it obvious
 
         glEnable(GL_DEPTH_TEST)
@@ -263,7 +261,7 @@ class GLVideoWidget(QOpenGLWidget):
 
 
     # ---------- optional: freecam STL draw if no pose ----------
-    def _draw_stl_freecam(self):
+    def draw_stl_freecam(self):
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
         glLoadIdentity()
