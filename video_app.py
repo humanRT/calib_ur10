@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
 from camera_utils import *
 from gl_video_widget import GLVideoWidget
 from focus_assistant import FocusAssistant
+from pose_smoother import PoseSmoother
 from utils import Colors
 
 
@@ -26,6 +27,7 @@ class VideoApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("Calian Robotics")
         self.focus_assistant = FocusAssistant()
+        self.pose_smoother = PoseSmoother(alpha=0.7, timeout=0.3)
 
         # Camera setup
         self.ip = ip
@@ -43,8 +45,7 @@ class VideoApp(QMainWindow):
         self._feed_h: int | None = None
 
         # overlays
-        self.board_corners_history: list[np.ndarray] = []
-        self.history_size = 20
+        # self.history_size = 20
 
         # Grid state variables
         self.rows = None
@@ -90,6 +91,18 @@ class VideoApp(QMainWindow):
         exit_action.triggered.connect(self.close) # type: ignore
         file_menu.addAction(exit_action) # type: ignore
 
+        view_menu = menubar.addMenu("View") # type: ignore
+        self.action_toggle_border = QAction("Use Image-Aligned Border", self, checkable=True, checked=False) # type: ignore
+        self.action_toggle_border.toggled.connect(self.on_toggle_border)
+        view_menu.addAction(self.action_toggle_border) # type: ignore
+
+        # Button actions
+        self.start_button.clicked.connect(self.start_video)
+        self.focus_button.clicked.connect(self.toggle_focus)
+        self.clear_button.clicked.connect(self.clear_images)
+        self.stop_button.clicked.connect(self.stop_video)
+        self.exposure_slider.valueChanged.connect(self.set_exposure)
+
         # Timer for video updates
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
@@ -99,19 +112,12 @@ class VideoApp(QMainWindow):
                           (255, 0, 255),  # Y = magenta
                           (255, 255, 0))  # Z = cyan
 
-        # Button actions
-        self.start_button.clicked.connect(self.start_video)
-        self.focus_button.clicked.connect(self.focus_assist)
-        self.clear_button.clicked.connect(self.clear_images)
-        self.stop_button.clicked.connect(self.stop_video)
-        self.exposure_slider.valueChanged.connect(self.set_exposure)
-
         # --- ArUco/ChArUco setup ---
         # Pick a predefined ArUco dictionary
         self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
 
         self.board = cv2.aruco.CharucoBoard(
-            (7, 7),        # squaresX, squaresY
+            (7, 7),         # squaresX, squaresY
             0.020,          # squareLength (meters)
             0.016,          # markerLength (meters)
             self.dictionary # dictionary
@@ -199,7 +205,7 @@ class VideoApp(QMainWindow):
             origin[0], # type: ignore
             origin[0] + [axis_len, 0, 0], # type: ignore
             origin[0] + [0, axis_len, 0], # type: ignore
-            origin[0] + [0, 0, axis_len], # type: ignore
+            origin[0] + [0, 0, -axis_len], # type: ignore
         ]) # type: ignore
 
         imgpts, _ = cv2.projectPoints(axis_pts, rvec, tvec, self.camera_matrix, self.dist_coeffs) # type: ignore
@@ -320,24 +326,19 @@ class VideoApp(QMainWindow):
                     return True, (r, c)
 
         return False, (-1, -1)
-    
-    def set_board_corners(self, pts: np.ndarray) -> None:
-        self.board_corners_history.append(np.asarray(pts, dtype=np.float32))
-        if len(self.board_corners_history) > self.history_size:
-            self.board_corners_history.pop(0)
-        self.update()
 
-    def max_overlap(self, tol: float = 1.0) -> tuple[bool, int]:
+    def max_overlap(self, corners_history: list[np.ndarray], tol: float = 1.0) -> tuple[bool, int]:
         """
-        Return the maximum number of sets of four corners that are
-        within `tol` average Euclidean distance of each other.
+        Return (stable, max_count):
+        - stable = True if all sets overlap within tolerance
+        - max_count = maximum overlap count observed
         """
-        if not self.board_corners_history:
-            return 0
+        if not corners_history:
+            return False, 0
 
         # Normalize history: (4,2) arrays, sorted
         sets = []
-        for corners in self.board_corners_history:
+        for corners in corners_history:
             c = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
             sets.append(np.array(sorted(c.tolist())))
 
@@ -349,17 +350,36 @@ class VideoApp(QMainWindow):
             for j in range(i + 1, n):
                 # compute per-corner Euclidean distances
                 dists = np.linalg.norm(sets[i] - sets[j], axis=1)
-                avg_dist = float(np.mean(dists))   # <-- ensure scalar
+                avg_dist = float(np.mean(dists))
                 if avg_dist < tol:
                     count += 1
             max_count = max(max_count, count)
 
-        return self.history_size == max_count, max_count
+        return len(corners_history) == max_count, max_count
 
     def keyPressEvent(self, event): # type: ignore
         """Exit cleanly when ESC is pressed."""
         if event.key() == Qt.Key_Escape: # type: ignore
             self.close()
+
+    def on_toggle_border(self, checked: bool):
+        self.gl.set_overlay_mode("image" if checked else "ideal")
+
+    def toggle_focus(self):
+        self.focus_active = not self.focus_active
+
+    def clear_images(self):
+        """Clear any activated grid cells and refresh the view."""
+        # If the grid has been initialized, reset activation state
+        if isinstance(self.cell_active, np.ndarray) and self.cell_active.size > 0:
+            self.cell_active[...] = False
+        # Optional: also clear the fading red board-corner trails in the GL overlay
+        # Comment this out if you want to keep the trails when clearing cells
+        if hasattr(self.gl, "board_corners_history"):
+            self.gl.board_corners_history.clear()
+
+        # Force an immediate visual refresh
+        self.gl.update()
 
     def start_video(self):
         if self.cam is None:
@@ -381,24 +401,8 @@ class VideoApp(QMainWindow):
             from pypylon import pylon  # local import, only for the enum
             self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
 
-        self.timer.start(30)
-
-    def focus_assist(self):
-        self.focus_active = not self.focus_active
-
-    def clear_images(self):
-        """Clear any activated grid cells and refresh the view."""
-        # If the grid has been initialized, reset activation state
-        if isinstance(self.cell_active, np.ndarray) and self.cell_active.size > 0:
-            self.cell_active[...] = False
-        # Optional: also clear the fading red board-corner trails in the GL overlay
-        # Comment this out if you want to keep the trails when clearing cells
-        if hasattr(self.gl, "board_corners_history"):
-            self.gl.board_corners_history.clear()
-
-        # Force an immediate visual refresh
-        self.gl.update()
-
+        self.timer.start(30)    
+    
     def stop_video(self):
         self.timer.stop()
         if self.cam:
@@ -415,187 +419,217 @@ class VideoApp(QMainWindow):
             except Exception as e:
                 print("Exposure set failed:", e)
 
+    # ---------- main loop ----------
     def update_frame(self):
-        res = None
-        
         if not (self.cam and self.cam.IsGrabbing() and self.converter):
             return
         
+        res = None        
         try:
             res = self.cam.RetrieveResult(1000, pylon.TimeoutHandling_ThrowException)    # raise exception if no new frame arrives whithin that timeout
-            if res.GrabSucceeded():
-                rgb = self.converter.Convert(res)
-                img_array = rgb.GetArray()
-                h, w, _ = img_array.shape
-                self.ensure_feed_size(w, h)
-                border_color = None
+            if not res.GrabSucceeded():
+                return
+            
+            rgb = self.converter.Convert(res)
+            img_array = rgb.GetArray()
+            h, w, _ = img_array.shape
+            self.ensure_feed_size(w, h)
+            border_color = None
 
-                # ---- Make overlay copy ----
-                overlay = img_array.copy()
+            # ---- Make overlay copy ----
+            overlay = img_array.copy()
 
-                # ---- Draw transparent grid circles (background) ----
-                grid = overlay.copy()
-                if not self.focus_active:
-                    self.draw_grid_circles(grid, 24)
-                    cv2.addWeighted(grid, 0.3, overlay, 0.7, 0, overlay)
+            # ---- Draw transparent grid circles (background) ----
+            grid = overlay.copy()
+            if not self.focus_active:
+                self.draw_grid_circles(grid, 24)
+                cv2.addWeighted(grid, 0.5, overlay, 0.5, 0, overlay)
 
-                # ---- FPS calculation ----
-                now = time.time()
-                if self.prev_time is not None:
-                    dt = now - self.prev_time
-                    if dt > 0:
-                        self.fps = 1.0 / dt
-                self.prev_time = now
+            # ---- FPS calculation ----
+            now = time.time()
+            if self.prev_time is not None:
+                dt = now - self.prev_time
+                if dt > 0:
+                    self.fps = 1.0 / dt
+            self.prev_time = now
 
-                # ---- Convert to grayscale for detection (clean image, no drawings) ----
-                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            # ---- Convert to grayscale for detection (clean image, no drawings) ----
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
 
-                # --- Detect ArUco markers ---
-                corners, ids, _ = cv2.aruco.detectMarkers(gray, self.dictionary)
+            # --- Detect ArUco markers ---
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.dictionary)
 
-                new_corners_added = False
-                pose_detected = False
+            new_corners_added = False
+            pose_detected = False
 
-                if ids is not None and len(ids) > 0:
-                    # Draw detected markers on overlay
-                    cv2.aruco.drawDetectedMarkers(overlay, corners, ids)
+            if ids is not None and len(ids) > 0:
+                # Draw detected markers on overlay
+                cv2.aruco.drawDetectedMarkers(overlay, corners, ids)
 
-                    retval, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
-                        markerCorners=corners,
-                        markerIds=ids,
-                        image=gray,
-                        board=self.board
-                    )
-
-                    if retval is not None and retval >= 6:
-                        ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-                            charuco_corners, charuco_ids, self.board,
-                            self.camera_matrix, self.dist_coeffs, None, None # type: ignore
-                        ) # type: ignore
-
-                        pose_drawn = False
-
-                        if ok and rvec is not None and tvec is not None:
-                            # 3D board corners in board coordinates (Z=0 plane)
-                            L = self.square_len
-                            sX, sY = self.squaresX, self.squaresY
-                            board_corners_obj = np.float32([
-                                [0,    0,    0],
-                                [sX*L, 0,    0],
-                                [sX*L, sY*L, 0],
-                                [0,    sY*L, 0],
-                            ]) # type: ignore
-                            imgpts, _ = cv2.projectPoints(board_corners_obj, rvec, tvec, self.camera_matrix, self.dist_coeffs) # type: ignore
-                            self.set_board_corners(imgpts.reshape(-1, 2))
-                            new_corners_added = True
-
-                            # --- Project the board origin ---
-                            origin_imgpt, _ = cv2.projectPoints(
-                                np.array([[0, 0, 0]], dtype=np.float32),
-                                rvec, tvec,
-                                self.camera_matrix, self.dist_coeffs
-                            )
-                            origin_imgpt = origin_imgpt.reshape(2)
-
-                            self.gl.set_board_pose(rvec, tvec, self.board_corners_history)
-                            pose_detected = True
-                            
-                            # -------------------------------------------------
-                            # Cell activation logic/actions
-                            image_stable, max_count = self.max_overlap(tol=1.0)
-                            
-                            # Debug dot at origin
-                            dot_color = (0, 255, 0)  if image_stable else (255, 0, 0)
-                            cv2.circle(overlay, (int(origin_imgpt[0]), int(origin_imgpt[1])), 12, dot_color, -1)
-                            print(f"History: {len(self.board_corners_history)}, Overlap: {max_count}")
-
-                            if not self.focus_active:
-                                if not image_stable:
-                                    _, cell_id = self.is_at_cell(origin_imgpt)
-                                    self.current_r, self.current_c = cell_id
-
-                                else:
-                                    success, cell_id = self.activate_cell_at_point(origin_imgpt)    # Activate circle if origin is inside one
-                                    if success:
-                                        print(f"{Colors().text(str(cell_id), 'green')}")
-                                        
-                                        # Capture and save an image sized like the on-screen feed
-                                        r, c = cell_id
-                                        filename = f"cell_{r}_{c}.png"
-                                        filepath = os.path.join(self.calib_path, filename)
-
-                                        save_rgb = img_array
-                                        target_w = self._feed_w if self._feed_w else w
-                                        target_h = self._feed_h if self._feed_h else h
-
-                                        if target_w != w or target_h != h:
-                                            interp = cv2.INTER_AREA if target_w < w or target_h < h else cv2.INTER_LINEAR
-                                            save_rgb = cv2.resize(save_rgb, (target_w, target_h), interpolation=interp)
-
-                                        cv2.imwrite(filepath, cv2.cvtColor(save_rgb, cv2.COLOR_RGB2BGR))
-                                        # print(f"Saved image: {filepath}")
-                            # -------------------------------------------------
-
-                            # Save copy before drawing axes
-                            before_axes = overlay.copy()
-                            self.draw_custom_axes(overlay, rvec, tvec, axis_len=0.05, colors=self.axes_colors, center=True)
-
-                            # Check if axes changed the overlay
-                            if not np.array_equal(before_axes, overlay):
-                                pose_drawn = True
-                                border_color = (0, 255, 0)  # green
-                        
-                        else:
-                            # Lost detection: reset timer
-                            self._plate_seen_start = None
-
-                        if not pose_drawn:
-                            border_color = (255, 0, 0)  # red (pose unstable or axes skipped)
-
-                    elif retval is not None and retval > 0:
-                        border_color = (255, 255, 0)  # yellow (corners detected but too few for pose)
-
-                if not pose_detected and getattr(self.gl, "pose_valid", False):
-                    self.gl.clear_board_pose()
-
-                # ---- Draw border if needed ----
-                if border_color is not None:
-                    thickness = 16
-                    cv2.rectangle(overlay, (0, 0), (w - 1, h - 1), border_color, thickness)
-
-                # ---- FPS text ----
-                bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-                cv2.putText(
-                    bgr,
-                    f"FPS: {self.fps:.1f}",
-                    (20, h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
+                retval, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
+                    markerCorners=corners,
+                    markerIds=ids,
+                    image=gray,
+                    board=self.board
                 )
 
-                # --- If nothing added, decay history ---
-                if not new_corners_added and self.gl.board_corners_history:
-                    self.gl.board_corners_history.pop(0)
-                    self.gl.update()
+                if retval is not None and retval >= 6:
+                    ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
+                        charuco_corners, charuco_ids, self.board,
+                        self.camera_matrix, self.dist_coeffs, None, None # type: ignore
+                    ) # type: ignore
 
-                # ---- Convert back to RGB for Qt ----
-                # rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                # h, w, ch = rgb.shape
-                # bytes_per_line = ch * w
-                # qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                # self.label.setPixmap(QPixmap.fromImage(qimg))
+                    pose_drawn = False
+                    if ok and rvec is not None and tvec is not None:
+                        # ------- IDEAL border from model and intrinsics -------
+                        L = self.square_len
+                        L = self.square_len
+                        sX, sY = self.squaresX, self.squaresY
+                        board_corners_obj = np.float32([
+                            [0,    0,    0],
+                            [sX*L, 0,    0],
+                            [sX*L, sY*L, 0],
+                            [0,    sY*L, 0],
+                        ]) # type: ignore
+                        ideal_imgpts, _ = cv2.projectPoints(board_corners_obj, rvec, tvec, self.camera_matrix, self.dist_coeffs) # type: ignore
+                        self.gl.push_ideal_corners(ideal_imgpts.reshape(-1, 2))
+                        new_corners_added = True
 
-                # --- Focus assistant ---
-                if self.focus_active:
-                    norm, hint, improving = self.focus_assistant.get_focus_info(img_array)
-                    self.focus_assistant.draw_focus_bar(bgr, norm, hint, improving)  # draw on bgr, not overlay
+                        # ------- IMAGE-aligned border from outer marker corners -------
+                        # gather all detected marker quad corners in pixel space
+                        all_pts = []
+                        for mk in corners:
+                            all_pts.append(mk.reshape(4, 2))
+                        if all_pts:
+                            all_pts = np.vstack(all_pts).astype(np.float32)  # (N,2)
+                            hull = cv2.convexHull(all_pts)                          # (H,1,2)
+                            approx = cv2.approxPolyDP(hull, epsilon=0.01 * cv2.arcLength(hull, True), closed=True)
+                            if len(approx) == 4:
+                                img_quad = approx.reshape(4, 2)
+                            else:
+                                rect = cv2.minAreaRect(all_pts)  # ((cx,cy),(w,h),angle)
+                                box = cv2.boxPoints(rect)        # 4x2
+                                img_quad = box.astype(np.float32)
+                            # order clockwise
+                            c = img_quad.mean(axis=0)
+                            ang = np.arctan2(img_quad[:, 1] - c[1], img_quad[:, 0] - c[0])
+                            order = np.argsort(ang)
+                            img_quad = img_quad[order]
+                            self.gl.push_image_corners(img_quad)
 
-                # Convert back to RGB for OpenGL upload
-                rgb_for_gl = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                self.gl.set_frame(rgb_for_gl)
+                        # --- Project the board origin ---
+                        origin_imgpt, _ = cv2.projectPoints(
+                            np.array([[0, 0, 0]], dtype=np.float32),
+                            rvec, tvec,
+                            self.camera_matrix, self.dist_coeffs
+                        )
+                        origin_imgpt = origin_imgpt.reshape(2)
+
+                        self.gl.set_board_pose(rvec, tvec)
+                        pose_detected = True
+                        
+                        # -------------------------------------------------
+                        # Cell activation logic/actions
+                        if self.gl.overlay_mode == "image":
+                            image_stable, max_count = self.max_overlap(self.gl.image_corners_history, tol=1.0)
+                        else:
+                            image_stable, max_count = self.max_overlap(self.gl.ideal_corners_history, tol=1.0)
+
+                        # Debug dot at origin
+                        dot_color = (0, 255, 0)  if image_stable else (255, 0, 0)
+                        cv2.circle(overlay, (int(origin_imgpt[0]), int(origin_imgpt[1])), 12, dot_color, -1)
+                        print(f"History: {len(self.gl.ideal_corners_history)}, Overlap: {max_count}")
+
+                        if not self.focus_active:
+                            if not image_stable:
+                                _, cell_id = self.is_at_cell(origin_imgpt)
+                                self.current_r, self.current_c = cell_id
+
+                            else:
+                                success, cell_id = self.activate_cell_at_point(origin_imgpt)    # Activate circle if origin is inside one
+                                if success:
+                                    print(f"{Colors().text(str(cell_id), 'green')}")
+                                    
+                                    # Capture and save an image sized like the on-screen feed
+                                    r, c = cell_id
+                                    filename = f"cell_{r}_{c}.png"
+                                    filepath = os.path.join(self.calib_path, filename)
+
+                                    save_rgb = img_array
+                                    target_w = self._feed_w if self._feed_w else w
+                                    target_h = self._feed_h if self._feed_h else h
+
+                                    if target_w != w or target_h != h:
+                                        interp = cv2.INTER_AREA if target_w < w or target_h < h else cv2.INTER_LINEAR
+                                        save_rgb = cv2.resize(save_rgb, (target_w, target_h), interpolation=interp)
+
+                                    cv2.imwrite(filepath, cv2.cvtColor(save_rgb, cv2.COLOR_RGB2BGR))
+                                    # print(f"Saved image: {filepath}")
+                        # -------------------------------------------------
+
+                        # Save copy before drawing axes
+                        before_axes = overlay.copy()
+                        self.draw_custom_axes(overlay, rvec, tvec, axis_len=0.1, colors=self.axes_colors, center=True)
+
+                        # Check if axes changed the overlay
+                        if not np.array_equal(before_axes, overlay):
+                            pose_drawn = True
+                            border_color = (0, 255, 0)  # green
+                    
+                    else:
+                        # Lost detection: reset timer
+                        self._plate_seen_start = None
+
+                    if not pose_drawn:
+                        border_color = (255, 0, 0)  # red (pose unstable or axes skipped)
+
+                elif retval is not None and retval > 0:
+                    border_color = (255, 255, 0)  # yellow (corners detected but too few for pose)
+
+            if not pose_detected and getattr(self.gl, "pose_valid", False):
+                self.gl.clear_board_pose()
+
+            # ---- Draw border if needed ----
+            if border_color is not None:
+                thickness = 16
+                cv2.rectangle(overlay, (0, 0), (w - 1, h - 1), border_color, thickness)
+
+            # ---- FPS text ----
+            bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+            cv2.putText(
+                bgr,
+                f"FPS: {self.fps:.1f}",
+                (20, h - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+            # --- If nothing added, decay history ---
+            if not new_corners_added:
+                if self.gl.image_corners_history:
+                    self.gl.image_corners_history.pop(0)
+                if self.gl.ideal_corners_history:
+                    self.gl.ideal_corners_history.pop(0)
+                self.gl.update()
+
+            # ---- Convert back to RGB for Qt ----
+            # rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            # h, w, ch = rgb.shape
+            # bytes_per_line = ch * w
+            # qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            # self.label.setPixmap(QPixmap.fromImage(qimg))
+
+            # --- Focus assistant ---
+            if self.focus_active:
+                norm, hint, improving = self.focus_assistant.get_focus_info(img_array)
+                self.focus_assistant.draw_focus_bar(bgr, norm, hint, improving)  # draw on bgr, not overlay
+
+            # Convert back to RGB for OpenGL upload
+            rgb_for_gl = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            self.gl.set_frame(rgb_for_gl)
         
         except pylon.TimeoutException:
             print(Colors.text("Connection with camera lost! (timeout)", "red"))

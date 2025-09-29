@@ -14,47 +14,6 @@ class GLVideoWidget(QOpenGLWidget):
     OpenGL widget for displaying video frames, board overlays, and STL meshes,
     and for rendering 3D geometry registered to the ChArUco board pose.
     """
-
-    # ---------- public API you will call from VideoApp ----------
-    def set_camera_calibration(self, camera_matrix: np.ndarray, dist_coeffs: np.ndarray | None = None) -> None:
-        self.camera_matrix = camera_matrix.astype(np.float32).copy()
-        self.dist_coeffs = None if dist_coeffs is None else dist_coeffs.astype(np.float32).copy()
-        self.update()
-
-    def configure_board(self, squaresX: int, squaresY: int, square_len: float) -> None:
-        self.squaresX = int(squaresX)
-        self.squaresY = int(squaresY)
-        self.square_len = float(square_len)
-        self.update()
-
-    def set_board_pose(self, rvec: np.ndarray, tvec: np.ndarray, board_corner_history: list[np.ndarray]) -> None:
-        # Expect shapes (3,1) or (1,3) or (3,)
-        self.rvec = np.array(rvec, dtype=np.float32).reshape(3, 1)
-        self.tvec = np.array(tvec, dtype=np.float32).reshape(3, 1)
-        self.board_corners_history = board_corner_history
-        self.pose_valid = True
-        self.update()
-
-    def clear_board_pose(self) -> None:
-        self.pose_valid = False
-        self.rvec = None
-        self.tvec = None
-        self.update()
-
-    def load_stl(self, filepath: str) -> None:
-        verts, tris, norms = load_stl_file(filepath)
-        self.mesh_vertices, self.mesh_triangles, self.mesh_normals = verts, tris, norms
-        self.update()
-    
-    def set_frame(self, rgb_frame: np.ndarray) -> None:
-        self.frame = rgb_frame
-        h, w, _ = rgb_frame.shape
-        if (w, h) != (self._frame_w, self._frame_h):
-            self._frame_w, self._frame_h = w, h
-            self.setFixedSize(w, h)
-            self.updateGeometry()
-        self.update()
-
     # ---------- Qt / GL lifecycle ----------
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -65,8 +24,12 @@ class GLVideoWidget(QOpenGLWidget):
         self._frame_w, self._frame_h = 1280, 1024
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setFixedSize(self._frame_w, self._frame_h)
-        # overlays
-        self.board_corners_history: list[np.ndarray] = []
+        # overlay mode and histories
+        self.overlay_mode: str = "ideal"  # "ideal" or "image"
+        self.ideal_corners_history: list[np.ndarray] = []
+        self.image_corners_history: list[np.ndarray] = []
+        # self.history_size: int = 20
+        self.max_history = 20
         # STL mesh
         self.mesh_vertices = None
         self.mesh_triangles = None
@@ -103,6 +66,63 @@ class GLVideoWidget(QOpenGLWidget):
         self._h = max(1, h)
         glViewport(0, 0, self._w, self._h)
 
+    # ---------- public API you will call from VideoApp ----------
+    def set_camera_calibration(self, camera_matrix: np.ndarray, dist_coeffs: np.ndarray | None = None) -> None:
+        self.camera_matrix = camera_matrix.astype(np.float32).copy()
+        self.dist_coeffs = None if dist_coeffs is None else dist_coeffs.astype(np.float32).copy()
+        self.update()
+
+    def configure_board(self, squaresX: int, squaresY: int, square_len: float) -> None:
+        self.squaresX = int(squaresX)
+        self.squaresY = int(squaresY)
+        self.square_len = float(square_len)
+        self.update()
+
+    def set_board_pose(self, rvec, tvec):
+        self.pose_valid = True
+        self.rvec = rvec
+        self.tvec = tvec
+
+    def set_overlay_mode(self, mode: str) -> None:
+        assert mode in ("image", "ideal")
+        self.overlay_mode = mode
+        self.update()
+
+    def clear_board_pose(self) -> None:
+        self.pose_valid = False
+        self.rvec = None
+        self.tvec = None
+        self.update()
+
+    def push_image_corners(self, pts: np.ndarray) -> None:
+        self.image_corners_history.append(np.asarray(pts, dtype=np.float32))
+        if len(self.image_corners_history) > self.max_history:
+            self.image_corners_history.pop(0)
+
+    def push_ideal_corners(self, pts: np.ndarray) -> None:
+        self.ideal_corners_history.append(np.asarray(pts, dtype=np.float32))
+        if len(self.ideal_corners_history) > self.max_history:
+            self.ideal_corners_history.pop(0)
+
+    def get_active_corners(self) -> list[np.ndarray]:
+        if self.overlay_mode == "image":
+            return self.image_corners_history
+        return self.ideal_corners_history
+
+    def load_stl(self, filepath: str) -> None:
+        verts, tris, norms = load_stl_file(filepath)
+        self.mesh_vertices, self.mesh_triangles, self.mesh_normals = verts, tris, norms
+        self.update()
+    
+    def set_frame(self, rgb_frame: np.ndarray) -> None:
+        self.frame = rgb_frame
+        h, w, _ = rgb_frame.shape
+        if (w, h) != (self._frame_w, self._frame_h):
+            self._frame_w, self._frame_h = w, h
+            self.setFixedSize(w, h)
+            self.updateGeometry()
+        self.update()
+    
     # ---------- rendering ----------
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) # type: ignore
@@ -117,6 +137,7 @@ class GLVideoWidget(QOpenGLWidget):
         # -- Pass 2: 3D content registered to the board pose if we have one
         if self.pose_valid and self.camera_matrix is not None and self.squaresX and self.squaresY and self.square_len:
             self.draw_cube_on_plate()
+            pass
         elif self.mesh_vertices is not None:
             # Fallback: free 3D view of STL if no pose
             self.draw_stl_freecam()
@@ -149,12 +170,13 @@ class GLVideoWidget(QOpenGLWidget):
         glTexCoord2f(0, 0); glVertex2f(-1,  1)
         glEnd()
 
-        # red fading board outline
-        if self.board_corners_history:
+         # pick which history to draw
+        active_hist = self.ideal_corners_history if self.overlay_mode == "ideal" else self.image_corners_history
+        if active_hist:
             glDisable(GL_TEXTURE_2D)
             glLineWidth(2.0)
-            n = len(self.board_corners_history)
-            for i, corners in enumerate(self.board_corners_history):
+            n = len(active_hist)
+            for i, corners in enumerate(active_hist):
                 alpha = (i + 1) / n
                 glColor4f(1.0, 0.0, 0.0, alpha)
                 glBegin(GL_LINE_LOOP)
@@ -258,7 +280,6 @@ class GLVideoWidget(QOpenGLWidget):
         glColor3f(1, 1, 0)
         glVertex3f(1, 0, 0); glVertex3f(1, 0, -1); glVertex3f(1, 1, -1); glVertex3f(1, 1, 0)
         glEnd()
-
 
     # ---------- optional: freecam STL draw if no pose ----------
     def draw_stl_freecam(self):
