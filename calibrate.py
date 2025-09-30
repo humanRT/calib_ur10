@@ -7,6 +7,7 @@ lock = SingleInstance()
 lock.acquire()
 # -----------------------------------------------------------------------------
 
+import cv2
 import os
 import sys
 import pathlib
@@ -17,8 +18,6 @@ from camera_utils import *
 from video_app import VideoApp
 
 def main():
-    # os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
-    # os.environ["QT_SCALE_FACTOR"] = "1.5"
     app = QApplication(sys.argv)
     _ = list_cameras()
 
@@ -31,7 +30,6 @@ def main():
     print(f"IP: {ip}")
     print(f"calibData Path: {calib_path}")
 
-    # path_to_stl = str(script_dir / "resources" / "base_link.stl")
     path_to_stl = None
     window = VideoApp(ip, calib_path=calib_path, stl_path=path_to_stl)
     window.show()

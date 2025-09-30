@@ -23,12 +23,8 @@ class PoseSmoother:
             self.smoothed_rvec = rvec.copy()
             self.smoothed_tvec = tvec.copy()
         else:
-            self.smoothed_rvec = (
-                self.alpha * rvec + (1 - self.alpha) * self.smoothed_rvec
-            )
-            self.smoothed_tvec = (
-                self.alpha * tvec + (1 - self.alpha) * self.smoothed_tvec
-            )
+            self.smoothed_rvec = (self.alpha * rvec + (1 - self.alpha) * self.smoothed_rvec)
+            self.smoothed_tvec = (self.alpha * tvec + (1 - self.alpha) * self.smoothed_tvec) # type: ignore
 
         self.last_update = time.time()
 

@@ -21,9 +21,10 @@ class GLVideoWidget(QOpenGLWidget):
         self.frame: Optional[np.ndarray] = None
         self.texture_id: Optional[int] = None
         self._w, self._h = 1, 1
-        self._frame_w, self._frame_h = 1280, 1024
+        self.feed_w, self.feed_h = 1, 1
+        self.frame_w, self.frame_h = 1280, 1024
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.setFixedSize(self._frame_w, self._frame_h)
+        self.setFixedSize(self.frame_w, self.frame_h)
         # overlay mode and histories
         self.overlay_mode: str = "ideal"  # "ideal" or "image"
         self.ideal_corners_history: list[np.ndarray] = []
@@ -45,7 +46,7 @@ class GLVideoWidget(QOpenGLWidget):
         self.pose_valid: bool = False
 
     def sizeHint(self) -> QSize:
-        return QSize(self._frame_w, self._frame_h)
+        return QSize(self.frame_w, self.frame_h)
 
     def initializeGL(self) -> None:
         glClearColor(0.0, 0.0, 0.0, 1.0)
@@ -117,22 +118,28 @@ class GLVideoWidget(QOpenGLWidget):
     def set_frame(self, rgb_frame: np.ndarray) -> None:
         self.frame = rgb_frame
         h, w, _ = rgb_frame.shape
-        if (w, h) != (self._frame_w, self._frame_h):
-            self._frame_w, self._frame_h = w, h
+        self.feed_w, self.feed_h = w, h  # <-- track feed resolution here
+        if (w, h) != (self.frame_w, self.frame_h):
+            self.frame_w, self.frame_h = w, h
             self.setFixedSize(w, h)
             self.updateGeometry()
         self.update()
     
     # ---------- rendering ----------
     def paintGL(self):
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) # type: ignore
+        # Clear both color and depth buffers
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)  # type: ignore
 
         # -- Pass 1: 2D video + red corners overlay
         if self.frame is not None:
-            self.draw_video_and_corners()            
+            self.draw_video_and_corners()
 
-        # Ensure a clean Z buffer before 3D
+        # Ensure a clean Z buffer before 3D rendering
         glClear(GL_DEPTH_BUFFER_BIT)
+
+        # -- Pass 1: Axes overlay
+        if self.rvec is not None and self.tvec is not None:
+            self.draw_axes(length=0.1)   # this should mimic OpenCV's arrowed axes
 
         # -- Pass 2: 3D content registered to the board pose if we have one
         if self.pose_valid and self.camera_matrix is not None and self.squaresX and self.squaresY and self.square_len:
@@ -140,11 +147,12 @@ class GLVideoWidget(QOpenGLWidget):
             pass
         elif self.mesh_vertices is not None:
             # Fallback: free 3D view of STL if no pose
-            self.draw_stl_freecam()
+            self.draw_stl_freecam()        
 
     # ---------- helpers: 2D pass ----------
     def draw_video_and_corners(self):
-        h, w, _ = self.frame.shape # type: ignore
+        # Always use feed resolution for mapping to NDC
+        h, w = self.feed_h, self.feed_w
 
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
@@ -170,7 +178,7 @@ class GLVideoWidget(QOpenGLWidget):
         glTexCoord2f(0, 0); glVertex2f(-1,  1)
         glEnd()
 
-         # pick which history to draw
+        # pick which history to draw
         active_hist = self.ideal_corners_history if self.overlay_mode == "ideal" else self.image_corners_history
         if active_hist:
             glDisable(GL_TEXTURE_2D)
@@ -200,8 +208,9 @@ class GLVideoWidget(QOpenGLWidget):
         cx = float(self.camera_matrix[0, 2]) # type: ignore
         cy = float(self.camera_matrix[1, 2]) # type: ignore
 
-        w = float(max(1, self._w))
-        h = float(max(1, self._h))
+        # Always use feed resolution, not widget size
+        w = float(max(1, self.feed_w))
+        h = float(max(1, self.feed_h))
 
         proj = np.zeros((4, 4), dtype=np.float32)
         proj[0, 0] = 2.0 * fx / w
@@ -234,52 +243,159 @@ class GLVideoWidget(QOpenGLWidget):
         self.load_projection_from_intrinsics()
         self.load_modelview_from_cv_pose()
 
-        board_w = float(self.squaresX) * float(self.square_len) # type: ignore
-        board_h = float(self.squaresY) * float(self.square_len) # type: ignore
-        cube_height = 0.5 * min(board_w, board_h)  # make it obvious
+        board_w = float(self.squaresX) * float(self.square_len)  # type: ignore
+        board_h = float(self.squaresY) * float(self.square_len)  # type: ignore
+        cube_height = 0.5 * min(board_w, board_h)
 
         glEnable(GL_DEPTH_TEST)
         glDisable(GL_TEXTURE_2D)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         glPushMatrix()
-        # --- shift cube so it is centered on the board ---
         glTranslatef(board_w / 2.0, board_h / 2.0, 0.0)
-
-        # Scale a unit cube [0,1]^3 to board footprint in X,Y and desired height in Z
-        glScalef(board_w * 0.25, board_h * 0.25, cube_height)
-        self.draw_unit_cube()
+        # glScalef(board_w * 0.375, board_h * 0.25, cube_height)
+        self.draw_unit_cube(alpha=0.85)   # translucent cube
         glPopMatrix()
 
         glDisable(GL_DEPTH_TEST)
         glEnable(GL_TEXTURE_2D)
 
         # restore matrices
-        glPopMatrix()            # MODELVIEW
+        glPopMatrix()
         glMatrixMode(GL_PROJECTION)
         glPopMatrix()
         glMatrixMode(GL_MODELVIEW)
 
-    def draw_unit_cube(self):
+    def draw_unit_cube(self, squareLength=0.06, height=0.06, alpha=1.0):
+        """Draws a cube centered sideways at the origin.
+        Base and top squares match the size of a ChArUco board square.
+        - squareLength: edge length of a ChArUco square
+        - height: vertical size of the cube
+        """
+        half = squareLength / 2.0
+
         glBegin(GL_QUADS)
-        # Top z=0 (magenta) → sits on the plate
-        glColor3f(1, 0, 1)
-        glVertex3f(0, 0, 0); glVertex3f(0, 1, 0); glVertex3f(1, 1, 0); glVertex3f(1, 0, 0)
-        # Bottom z=-1 (cyan) → extruded downward
-        glColor3f(0, 1, 1)
-        glVertex3f(0, 0, -1); glVertex3f(1, 0, -1); glVertex3f(1, 1, -1); glVertex3f(0, 1, -1)
-        # Front y=1 (red)
-        glColor3f(1, 0, 0)
-        glVertex3f(0, 1, 0); glVertex3f(1, 1, 0); glVertex3f(1, 1, -1); glVertex3f(0, 1, -1)
-        # Back y=0 (green)
-        glColor3f(0, 1, 0)
-        glVertex3f(0, 0, 0); glVertex3f(0, 0, -1); glVertex3f(1, 0, -1); glVertex3f(1, 0, 0)
-        # Left x=0 (blue)
-        glColor3f(0, 0, 1)
-        glVertex3f(0, 0, 0); glVertex3f(0, 1, 0); glVertex3f(0, 1, -1); glVertex3f(0, 0, -1)
-        # Right x=1 (yellow)
-        glColor3f(1, 1, 0)
-        glVertex3f(1, 0, 0); glVertex3f(1, 0, -1); glVertex3f(1, 1, -1); glVertex3f(1, 1, 0)
+        # Top z=0 (magenta)
+        glColor4f(1, 0, 1, alpha)
+        glVertex3f(-half, -half, 0); glVertex3f(-half,  half, 0)
+        glVertex3f( half,  half, 0); glVertex3f( half, -half, 0)
+
+        # Bottom z=-height (cyan)
+        glColor4f(0, 1, 1, alpha)
+        glVertex3f(-half, -half, -height); glVertex3f( half, -half, -height)
+        glVertex3f( half,  half, -height); glVertex3f(-half,  half, -height)
+
+        # Front y=+half (red)
+        glColor4f(1, 0, 0, alpha)
+        glVertex3f(-half,  half, 0); glVertex3f( half,  half, 0)
+        glVertex3f( half,  half, -height); glVertex3f(-half,  half, -height)
+
+        # Back y=-half (green)
+        glColor4f(0, 1, 0, alpha)
+        glVertex3f(-half, -half, 0); glVertex3f(-half, -half, -height)
+        glVertex3f( half, -half, -height); glVertex3f( half, -half, 0)
+
+        # Left x=-half (blue)
+        glColor4f(0, 0, 1, alpha)
+        glVertex3f(-half, -half, 0); glVertex3f(-half,  half, 0)
+        glVertex3f(-half,  half, -height); glVertex3f(-half, -half, -height)
+
+        # Right x=+half (yellow)
+        glColor4f(1, 1, 0, alpha)
+        glVertex3f( half, -half, 0); glVertex3f( half, -half, -height)
+        glVertex3f( half,  half, -height); glVertex3f( half,  half, 0)
         glEnd()
+
+    def draw_axes(self, length=0.05, arrow_size=0.01, center=True):
+        """
+        Draw colored XYZ axes in OpenGL, aligned with the board pose,
+        at the same location as OpenCV's cv2.projectPoints-based axes.
+        Colors: X=yellow, Y=magenta, Z=cyan.
+        """
+        if self.rvec is None or self.tvec is None:
+            return
+        if self.camera_matrix is None:
+            return
+
+        # Load camera projection and modelview from intrinsics + pose
+        self.load_projection_from_intrinsics()
+        self.load_modelview_from_cv_pose()
+
+        # Origin depends on whether we want center or corner
+        if center and self.squaresX and self.squaresY and self.square_len:
+            cx = (self.squaresX * self.square_len) / 2.0
+            cy = (self.squaresY * self.square_len) / 2.0
+            origin = (cx, cy, 0.0)
+        else:
+            origin = (0.0, 0.0, 0.0)
+
+        ox, oy, oz = origin
+
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_TEXTURE_2D)
+        glLineWidth(8.0)
+
+        # --- Axes lines ---
+        glBegin(GL_LINES)
+        # X axis (yellow)
+        glColor3f(0, 1, 1)
+        glVertex3f(ox, oy, oz)
+        glVertex3f(ox + length, oy, oz)
+
+        # Y axis (magenta)
+        glColor3f(1, 0, 1)
+        glVertex3f(ox, oy, oz)
+        glVertex3f(ox, oy + length, oz)
+
+        # Z axis (cyan) → negative Z in OpenCV convention
+        glColor3f(1, 1, 0)
+        glVertex3f(ox, oy, oz)
+        glVertex3f(ox, oy, oz - length)
+        glEnd()
+
+        # --- Arrowheads ---
+        self.draw_arrowhead((ox + length, oy, oz), axis="x", size=arrow_size, color=(0, 1, 1))
+        self.draw_arrowhead((ox, oy + length, oz), axis="y", size=arrow_size, color=(1, 0, 1))
+        self.draw_arrowhead((ox, oy, oz - length), axis="z", size=arrow_size, color=(1, 1, 0))
+
+        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_TEXTURE_2D)
+
+        # Restore matrices
+        glPopMatrix()  # MODELVIEW
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+
+    def draw_arrowhead(self, tip, axis="x", size=0.01, color=(1, 1, 1)):
+        """
+        Draw a simple V-shaped arrowhead at the given tip.
+        `axis` determines which direction the arrow points along.
+        """
+        tx, ty, tz = tip
+        glColor3f(*color)
+
+        glBegin(GL_LINES)
+        if axis == "x":  # arrow pointing along +X
+            glVertex3f(tx, ty, tz)
+            glVertex3f(tx - size, ty + size * 0.5, tz)
+            glVertex3f(tx, ty, tz)
+            glVertex3f(tx - size, ty - size * 0.5, tz)
+
+        elif axis == "y":  # arrow pointing along +Y
+            glVertex3f(tx, ty, tz)
+            glVertex3f(tx + size * 0.5, ty - size, tz)
+            glVertex3f(tx, ty, tz)
+            glVertex3f(tx - size * 0.5, ty - size, tz)
+
+        elif axis == "z":  # arrow pointing along -Z
+            glVertex3f(tx, ty, tz)
+            glVertex3f(tx + size * 0.5, ty, tz + size)
+            glVertex3f(tx, ty, tz)
+            glVertex3f(tx - size * 0.5, ty, tz + size)
+        glEnd()
+
 
     # ---------- optional: freecam STL draw if no pose ----------
     def draw_stl_freecam(self):
