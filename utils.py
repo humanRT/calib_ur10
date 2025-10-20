@@ -6,6 +6,16 @@ import fcntl
 import shutil
 from PyQt5.QtWidgets import QMessageBox, QApplication
 
+class Screen:
+    @staticmethod
+    def clear_console():
+        os.system('clear')
+
+    @staticmethod
+    def welcome():
+        Screen.clear_console()
+        print("----------------------------------------")
+        
 class SingleInstance:
     def __init__(self, lockfile=None):
         if lockfile is None:

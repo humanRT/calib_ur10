@@ -1,12 +1,14 @@
 import os
 import cv2 
 import time
+import pathlib
 import numpy as np
 
 from pypylon import pylon
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QMainWindow,
+    QMessageBox,
     QLabel,
     QPushButton,
     QVBoxLayout,
@@ -19,11 +21,11 @@ from camera_utils import *
 from gl_video_widget import GLVideoWidget
 from focus_assistant import FocusAssistant
 from pose_smoother import PoseSmoother
-from utils import Colors
+from utils import Colors, FileHelper
 
 
 class VideoApp(QMainWindow):
-    def __init__(self, ip: str, calib_path: str, stl_path: str | None = None):
+    def __init__(self, ip: str, stl_path: str | None = None):
         super().__init__()
 
         self.setWindowTitle("Calian Robotics")
@@ -38,8 +40,7 @@ class VideoApp(QMainWindow):
         self._plate_seen_start = None  # timestamp of when plate was first detected
 
         # Environment setup
-        self.display_scale = 2.0
-        self.calib_path = calib_path
+        self.display_scale = 1.0
 
         self.prev_time = None
         self.fps = 0.0
@@ -67,23 +68,17 @@ class VideoApp(QMainWindow):
 
         self.label = QLabel("Camera feed will appear here")
         self.label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.start_button = QPushButton("Start")
         self.focus_button = QPushButton("Focus")
         self.clear_button = QPushButton("Clear")
-        self.stop_button = QPushButton("Stop")
-        self.exposure_slider = QSlider(Qt.Horizontal) # type: ignore
-        self.exposure_slider.setEnabled(False)  # enabled once camera is open
+        self.calibrate_button = QPushButton("Calibrate")
 
         central_widget = QWidget()
         layout = QVBoxLayout(central_widget)
         # layout.addWidget(self.label)
         layout.addWidget(self.gl, alignment=Qt.AlignCenter)  # type: ignore
-        layout.addWidget(self.start_button)
         layout.addWidget(self.focus_button)
         layout.addWidget(self.clear_button)
-        layout.addWidget(self.stop_button)
-        layout.addWidget(QLabel("Exposure (µs):"))
-        layout.addWidget(self.exposure_slider)
+        layout.addWidget(self.calibrate_button)
         self.setCentralWidget(central_widget)
 
         # Menu bar
@@ -98,12 +93,40 @@ class VideoApp(QMainWindow):
         self.action_toggle_border.toggled.connect(self.on_toggle_border)
         view_menu.addAction(self.action_toggle_border) # type: ignore
 
+        # Camera switching
+        raw_cameras = list_cameras()
+        self.available_cameras = {}
+
+        # Handle tuple or list of DeviceInfo objects
+        if isinstance(raw_cameras, (list, tuple)):
+            for dev_info in raw_cameras:
+                try:
+                    name = dev_info.GetFriendlyName()
+                    self.available_cameras[name] = dev_info
+                except Exception:
+                    pass
+        elif isinstance(raw_cameras, dict):
+            self.available_cameras = raw_cameras
+
+        if not self.available_cameras:
+            raise RuntimeError("No cameras found.")
+
+        # Pick the first camera by name
+        self.current_camera_name = next(iter(self.available_cameras.keys()))
+        device_name = self.current_camera_name
+
+        # Camera menu
+        camera_menu = menubar.addMenu("Camera")
+        for cam_name in self.available_cameras.keys():
+            act = QAction(cam_name, self, checkable=True, checked=(cam_name == device_name))
+            act.triggered.connect(lambda checked, name=cam_name: self.switch_camera(name))
+            camera_menu.addAction(act)
+        self.camera_actions = camera_menu.actions()
+
         # Button actions
-        self.start_button.clicked.connect(self.start_video)
         self.focus_button.clicked.connect(self.toggle_focus)
         self.clear_button.clicked.connect(self.clear_images)
-        self.stop_button.clicked.connect(self.stop_video)
-        self.exposure_slider.valueChanged.connect(self.set_exposure)
+        self.calibrate_button.clicked.connect(self.start_calibration)
 
         # Timer for video updates
         self.timer = QTimer()
@@ -393,14 +416,6 @@ class VideoApp(QMainWindow):
             self.cam = create_camera(self.ip)
             self.cam.Open()
 
-            # Configure exposure slider range
-            exp_min = int(self.cam.ExposureTimeAbs.GetMin())
-            exp_max = int(self.cam.ExposureTimeAbs.GetMax())
-            exp_current = int(self.cam.ExposureTimeAbs.GetValue())
-            self.exposure_slider.setRange(exp_min, exp_max)
-            self.exposure_slider.setValue(exp_current)
-            self.exposure_slider.setEnabled(True)
-
         # (Re)create converter every time
         self.converter = make_converter()
 
@@ -418,14 +433,6 @@ class VideoApp(QMainWindow):
             # Don’t close/release here if you want to restart easily
         self.label.setText("Camera stopped")
 
-    def set_exposure(self, value):
-        if self.cam and self.cam.IsOpen():
-            try:
-                self.cam.ExposureAuto.SetValue("Off")  # disable auto
-                self.cam.ExposureTimeAbs.SetValue(value)
-            except Exception as e:
-                print("Exposure set failed:", e)
-
     def closeEvent(self, event): # type: ignore
         """Ensure camera closes cleanly when window exits."""
         self.stop_video()
@@ -433,6 +440,93 @@ class VideoApp(QMainWindow):
             self.cam.Close()
             self.cam = None
         event.accept()
+
+    def switch_camera(self, camera_name: str):
+        """Switch to a different connected camera."""
+        if camera_name == self.current_camera_name:
+            return
+
+        print(f"Switching camera from {self.current_camera_name} → {camera_name}")
+        self.stop_video()
+
+        try:
+            # Close current
+            if self.cam:
+                self.cam.Close()
+                self.cam = None
+
+            # Open new
+            from camera_utils import get_camera_ip_by_id
+            ip = get_camera_ip_by_id(camera_name)
+            self.cam = create_camera(ip)
+            self.cam.Open()
+
+            self.converter = make_converter()
+            self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+            self.current_camera_name = camera_name
+            print(f"Camera switched to {camera_name}")
+
+            # Update menu checks
+            for act in self.camera_actions:
+                act.setChecked(act.text() == camera_name)
+
+            self.timer.start(1)
+
+        except Exception as e:
+            print(f"Failed to switch to {camera_name}: {e}")
+
+    def start_calibration(self):
+        """
+        Create or reset a calibration directory for the currently selected camera.
+        Warns the user before deleting any existing data.
+        """
+        # --- Ensure we have a valid camera name ---
+        cam_name = getattr(self, "current_camera_name", None)
+        if not cam_name:
+            QMessageBox.warning(self, "No Camera Selected", "No active camera to calibrate.")
+            return
+
+        # Normalize folder name
+        cam_name = cam_name.replace(" ", "_").replace("(", "").replace(")", "")
+
+        # --- Build full directory path ---
+        script_dir = pathlib.Path(__file__).resolve().parent
+        base_dir = script_dir / "calibData"
+        base_dir.mkdir(exist_ok=True)
+        target_dir = base_dir / cam_name
+
+        helper = FileHelper(parent=self)
+
+        # --- If directory exists, ask before replacing ---
+        if target_dir.exists():
+            reply = QMessageBox.warning(
+                self,
+                "Overwrite Existing Data",
+                f"A folder for '{cam_name}' already exists.\n"
+                "Continuing will delete any previous calibration files.\n\n"
+                "Do you want to continue?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply == QMessageBox.Cancel:
+                print("Calibration canceled by user.")
+                return
+
+            helper.create_directory(str(target_dir), force_replace=True)
+            print(f"Recreated calibration folder: {target_dir}")
+        else:
+            helper.create_directory(str(target_dir), force_replace=True)
+            print(f"Created new calibration folder: {target_dir}")
+
+        # --- Update internal calibration path ---
+        self.calib_path = str(target_dir)
+
+        QMessageBox.information(
+            self,
+            "Calibration Ready",
+            f"Calibration folder ready:\n{target_dir}"
+        )
+
 
     # ---------- main loop ----------
     def update_frame(self):
@@ -449,10 +543,7 @@ class VideoApp(QMainWindow):
             if not res.GrabSucceeded():
                 return
             
-            rgb = self.converter.Convert(res)
-            t2 = time.time()
-
-            img_array = rgb.GetArray()
+            img_array = self.converter.convert_and_draw(res, label=self.current_camera_name)
             t3 = time.time()
 
             # print(f"Grab: {(t1 - t0) * 1000:.2f} ms "
@@ -591,7 +682,7 @@ class VideoApp(QMainWindow):
                             print(f"{Colors().text(str(cell_id), 'green')}")
                             # Capture and save an image sized like the on-screen feed
                             r, c = cell_id
-                            filename = f"cell_{r}_{c}.png"
+                            filename = f"{self.current_camera_name}_cell_{r}_{c}.png"
                             filepath = os.path.join(self.calib_path, filename)
                             save_rgb = img_array
                             target_w = self._feed_w if self._feed_w else w
@@ -604,15 +695,17 @@ class VideoApp(QMainWindow):
             else:
                 self.gl.clear_board_pose()
 
-            # ---- FPS text ----
+            # ---- Overlay camera name above converter-drawn FPS ----
             bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+            text_camera = f"{self.current_camera_name}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
             cv2.putText(
                 bgr,
-                f"FPS: {self.fps:.1f}",
-                (20, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0),
+                text_camera,
+                (20, 40),
+                font,
+                1.0,
+                (0, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
