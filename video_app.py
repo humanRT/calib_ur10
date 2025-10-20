@@ -39,6 +39,12 @@ class VideoApp(QMainWindow):
         self.focus_active = True
         self._plate_seen_start = None  # timestamp of when plate was first detected
 
+        # Default calibration directory (updated when 'Calibrate' is pressed)
+        script_dir = pathlib.Path(__file__).resolve().parent
+        base_dir = script_dir / "calibData"
+        base_dir.mkdir(exist_ok=True)
+        self.calib_path = str(base_dir)
+
         # Environment setup
         self.display_scale = 1.0
 
@@ -48,7 +54,7 @@ class VideoApp(QMainWindow):
         self._feed_h: int | None = None
 
         # overlays
-        # self.history_size = 20
+        self.stability_progress = 0.0
 
         # Grid state variables
         self.rows = None
@@ -295,6 +301,31 @@ class VideoApp(QMainWindow):
 
         return self.rows, self.cols, self.cell_h, self.cell_w
 
+    def draw_progress_ring(self, img, center, radius, percentage, color=(0, 255, 0), thickness=4):
+        """
+        Draw a ring (arc) around a point showing completion percentage (0–1).
+        """
+        if percentage <= 0:
+            return
+        percentage = np.clip(percentage, 0.0, 1.0)
+
+        # Arc angle span (0–360)
+        angle_end = int(360 * percentage)
+
+        # Draw arc
+        axes = (radius + 5, radius + 5)
+        cv2.ellipse(
+            img,
+            center,
+            axes,
+            0,              # rotation
+            0,              # startAngle
+            angle_end,      # endAngle
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
     def activate_cell_at_point(self, imgpt):
         """
         Try to activate the grid cell containing the given point.
@@ -512,21 +543,9 @@ class VideoApp(QMainWindow):
                 print("Calibration canceled by user.")
                 return
 
-            helper.create_directory(str(target_dir), force_replace=True)
-            print(f"Recreated calibration folder: {target_dir}")
-        else:
-            helper.create_directory(str(target_dir), force_replace=True)
-            print(f"Created new calibration folder: {target_dir}")
-
         # --- Update internal calibration path ---
         self.calib_path = str(target_dir)
-
-        QMessageBox.information(
-            self,
-            "Calibration Ready",
-            f"Calibration folder ready:\n{target_dir}"
-        )
-
+        helper.create_directory(str(target_dir), force_replace=True)
 
     # ---------- main loop ----------
     def update_frame(self):
@@ -543,7 +562,7 @@ class VideoApp(QMainWindow):
             if not res.GrabSucceeded():
                 return
             
-            img_array = self.converter.convert_and_draw(res, label=self.current_camera_name)
+            img_array = self.converter.convert_and_draw(res, label="")
             t3 = time.time()
 
             # print(f"Grab: {(t1 - t0) * 1000:.2f} ms "
@@ -552,10 +571,14 @@ class VideoApp(QMainWindow):
             # print("Resulting FPS:", self.cam.ResultingFrameRateAbs.GetValue())
             # print("Exposure (us):", self.cam.ExposureTimeAbs.GetValue())
 
-            border_color = None
             pose_detected = False
             new_corners_added = False
             rvec, tvec = None, None
+            origin_imgpt = None  # Ensure variable always exists
+
+            # Ensure defaults for stability metrics
+            max_count = 0
+            image_stable = False
 
             h, w, _ = img_array.shape
             self.ensure_feed_size(w, h)
@@ -670,9 +693,23 @@ class VideoApp(QMainWindow):
                 # Debug dot at origin
                 dot_color = (0, 255, 0) if image_stable else (255, 0, 0)
                 cv2.circle(overlay, (int(origin_imgpt[0]), int(origin_imgpt[1])), 12, dot_color, -1)
-                print(f"History: {len(self.gl.ideal_corners_history)}, Overlap: {max_count}")
+                
+            # --- Stability visualization (progress ring) ---
+            # This visualizes how close we are to stability (green dot threshold)
+            history_len = len(self.gl.ideal_corners_history)
+            if history_len > 0:
+                completion = max_count / history_len
+                completion = np.clip(completion, 0.0, 1.0)
 
-                if not self.focus_active:
+                # Draw ring around current grid cell
+                if 0 <= self.current_r < self.rows and 0 <= self.current_c < self.cols:
+                    cx = int(self.current_c * self.cell_w + self.cell_w / 2)
+                    cy = int(self.current_r * self.cell_h + self.cell_h / 2)
+                    radius = int(0.75 * self.cell_w / 2)
+                    self.draw_progress_ring(overlay, (cx, cy), radius, completion, color=(0, 255, 0), thickness=4)
+
+
+                if not self.focus_active and origin_imgpt is not None:
                     if not image_stable:
                         _, cell_id = self.is_at_cell(origin_imgpt)
                         self.current_r, self.current_c = cell_id
@@ -683,6 +720,11 @@ class VideoApp(QMainWindow):
                             # Capture and save an image sized like the on-screen feed
                             r, c = cell_id
                             filename = f"{self.current_camera_name}_cell_{r}_{c}.png"
+                            
+                            if not hasattr(self, "calib_path") or not self.calib_path:
+                                print("No calibration path defined yet. Press 'Calibrate' first.")
+                                return
+                            
                             filepath = os.path.join(self.calib_path, filename)
                             save_rgb = img_array
                             target_w = self._feed_w if self._feed_w else w
